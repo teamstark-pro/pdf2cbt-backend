@@ -47,22 +47,20 @@ else:
     log("⚠️ WARNING: GROQ_API_KEY missing!")
 
 def encode_image(image_path):
-    """Encodes image to Base64 for Groq."""
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
 def get_ai_config(image_paths):
     if not client: return None
     
-    # 🔥 UPDATED MODEL: Llama 4 Scout 🔥
+    # Updated to Scout (Visual capable)
     MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
     
     try:
-        # We process the first image. 
-        # Note: Llama 4 has a 4MB Base64 limit. Our DPI=100 ensures we stay well below (~0.5MB).
+        # Only sending the FIRST page to save limits/tokens
         base64_image = encode_image(image_paths[0])
         
-        log(f"🤖 Asking Groq ({MODEL_NAME}) to analyze layout...")
+        log(f"🤖 Extracting MAX DATA via Groq ({MODEL_NAME})...")
         
         completion = client.chat.completions.create(
             model=MODEL_NAME,
@@ -73,19 +71,21 @@ def get_ai_config(image_paths):
                         {
                             "type": "text",
                             "text": """
-                            You are an expert PDF Layout Analyzer. Look at this exam page image.
-                            I need to crop questions automatically.
-                            
-                            Return ONLY a valid JSON object with no markdown formatting or backticks.
-                            Keys required:
-                            1. "top_margin": Integer (Height in pixels of header to ignore. usually 50-100).
-                            2. "bottom_margin": Integer (Height in pixels of footer to ignore. usually 50).
-                            3. "regex_pattern": Python Regex string to find Question Number at start of line.
-                               - Example for "Q.1": "^Q\\\\.?[\\\\s-]?\\\\s?(\\\\d+)[\\\\.\\\\)]"
-                               - Example for "1 .": "^(\\\\d+)\\\\s*[\\\\.]"
-                            4. "is_two_column": Boolean (true if page has 2 vertical columns of questions).
-                            
-                            Output JSON only.
+                            Analyze this exam page image like a scanner. I need to crop questions.
+                            Return ONLY a valid JSON object with these EXACT keys:
+
+                            1. "top_margin": Int (Pixels from top to ignore e.g., headers. Usually 60-100).
+                            2. "bottom_margin": Int (Pixels from bottom to ignore e.g., footers. Usually 50).
+                            3. "left_margin": Int (Pixels from left to ignore e.g., line numbers. Default 0).
+                            4. "right_margin": Int (Pixels from right to ignore. Default 0).
+                            5. "regex_pattern": Python Regex for Question Start. 
+                               - STRICTLY follow the format. Escape backslashes.
+                               - For "Q.1", use "^Q\\\\.?[\\\\s-]?\\\\s?(\\\\d+)[\\\\.\\\\)]"
+                               - For "1 .", use "^(\\\\d+)\\\\s*[\\\\.]"
+                            6. "is_two_column": Boolean (true if 2 distinct vertical columns).
+                            7. "ignore_words": List of Strings (Specific words in header/footer to skip e.g. ["Page", "Section A", "Rough Work"]).
+
+                            OUTPUT JSON ONLY. NO MARKDOWN.
                             """
                         },
                         {
@@ -98,17 +98,17 @@ def get_ai_config(image_paths):
                 }
             ],
             temperature=0.1, 
-            max_tokens=512,
+            max_tokens=800, # Increased for more data
             top_p=1,
             stream=False,
             response_format={"type": "json_object"}
         )
         
         resp_content = completion.choices[0].message.content
-        log(f"📥 Groq Response: {resp_content}")
+        log(f"📥 Groq Data: {resp_content}")
         
         data = json.loads(resp_content)
-        log(f"✅ Groq Config Parsed: {data}")
+        log(f"✅ AI Config Parsed: {data}")
         return data
 
     except Exception as e:
@@ -123,30 +123,45 @@ def get_pdf_hash(path):
 def extract_questions_with_strategy(doc, strategy_name, config):
     extracted_data = []
     
+    # --- UNPACK MAX DATA ---
     top_m = int(config.get("top_margin", 50))
     bot_m = int(config.get("bottom_margin", 50))
+    left_m = int(config.get("left_margin", 0))    # NEW
+    right_m = int(config.get("right_margin", 0))  # NEW
     regex = config.get("regex_pattern")
-    force_two_col = config.get("is_two_column", False)
+    ignore_words = config.get("ignore_words", []) # NEW
     
-    log(f"🔄 Executing {strategy_name} | Regex: {regex} | 2-Col: {force_two_col}")
+    log(f"🔄 Strategy: {strategy_name} | Regex: {regex} | Margins: T{top_m}/B{bot_m}/L{left_m}/R{right_m}")
 
     for page_num in range(len(doc)):
         page = doc[page_num]
         height = page.rect.height
+        width = page.rect.width
         blocks = page.get_text("blocks")
         
         for b in blocks:
             text = b[4].strip()
             bbox = b[:4]
+            x0, y0, x1, y1 = bbox
 
-            if bbox[1] < top_m or bbox[3] > height - bot_m: continue 
+            # --- ENHANCED FILTERS ---
+            # 1. Geometric Margins (Top/Bottom/Left/Right)
+            if y0 < top_m or y1 > height - bot_m: continue
+            if x0 < left_m: continue
+            if x1 > width - right_m: continue
+            
+            # 2. Text Filters (Specific Words from AI)
+            if any(bad_word.lower() in text.lower() for bad_word in ignore_words):
+                continue
+            
+            # 3. Standard Garbage Filters
             if text.startswith("["): continue 
             if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", text, re.I): continue
 
             try:
                 q_match = re.search(regex, text, re.IGNORECASE)
                 if q_match:
-                    if any(x in text for x in ["Answer", "Solution", "Page", "Total"]): continue
+                    if any(x in text for x in ["Answer", "Solution", "Total", "Marks"]): continue
                     q_no_str = next((g for g in q_match.groups() if g), None)
                     if not q_no_str: continue
                     
@@ -157,7 +172,7 @@ def extract_questions_with_strategy(doc, strategy_name, config):
 
                     extracted_data.append({
                         "label": q_no_str, 
-                        "x0": bbox[0], "y0": bbox[1], 
+                        "x0": x0, "y0": y0, 
                         "page": page_num, 
                         "bbox": bbox
                     })
@@ -174,27 +189,27 @@ def process_cbt_logic(pdf_path):
     
     doc = fitz.open(pdf_path)
     
-    # Generate Images (DPI 100 for Speed & Size Safety)
-    pages_to_check = min(2, len(doc))
-    img_paths = []
-    for i in range(pages_to_check):
-        pix = doc[i].get_pixmap(dpi=100) # Safe DPI for 4MB limit
-        p_path = os.path.join(UPLOAD_FOLDER, f"analyze_page_{i}.jpg")
-        pix.save(p_path)
-        img_paths.append(p_path)
+    # Generate 1 High Quality Image for AI (Since limits are tight, 1 is enough)
+    pix = doc[0].get_pixmap(dpi=150)
+    p_path = os.path.join(UPLOAD_FOLDER, "analyze_page_0.jpg")
+    pix.save(p_path)
+    img_paths = [p_path]
 
     # Strategies
     strategies = []
     
-    # 1. GROQ LLAMA 4 STRATEGY
+    # 1. GROQ MAX STRATEGY
     ai_data = get_ai_config(img_paths)
     if ai_data:
         strategies.append({
-            "name": "GROQ_LLAMA_4_SCOUT",
+            "name": "GROQ_MAX_DATA",
             "top_margin": ai_data.get("top_margin", 60),
             "bottom_margin": ai_data.get("bottom_margin", 50),
+            "left_margin": ai_data.get("left_margin", 0),
+            "right_margin": ai_data.get("right_margin", 0),
             "regex_pattern": ai_data.get("regex_pattern"),
-            "is_two_column": ai_data.get("is_two_column", False)
+            "is_two_column": ai_data.get("is_two_column", False),
+            "ignore_words": ai_data.get("ignore_words", [])
         })
 
     # 2. FALLBACK
@@ -205,7 +220,6 @@ def process_cbt_logic(pdf_path):
         "is_two_column": False 
     })
     
-    # 3. PANIC
     strategies.append({
         "name": "PANIC_MODE",
         "top_margin": 0, "bottom_margin": 0,
@@ -233,7 +247,7 @@ def process_cbt_logic(pdf_path):
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
         "pdfCropperData": {SUBJECT_NAME: {SECTION_NAME: {}}},
         "appVersion": "1.30.0",
-        "generatedBy": f"Team_Stark_Groq_{used_strategy}"
+        "generatedBy": f"Team_Stark_Groq_Max_{used_strategy}"
     }
 
     force_two_col = active_config.get("is_two_column", False)
@@ -282,6 +296,7 @@ def process_cbt_logic(pdf_path):
         page = doc[q["page"]]
         pix = page.get_pixmap(dpi=200)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        
         scale_w = pix.width / pg_w
         scale_h = pix.height / pg_h
         
@@ -311,7 +326,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark Groq Llama-4 Backend 🚀"
+    return "Stark V16 (Groq Max Miner) 🚀"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
@@ -322,7 +337,7 @@ def upload_file():
         log("⛔ Unauthorized")
         return jsonify({"error": "Unauthorized"}), 403
 
-    log("🔵 New Authorized Request Received (Llama 4)")
+    log("🔵 New Request (Groq Max)")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['pdf']
     
