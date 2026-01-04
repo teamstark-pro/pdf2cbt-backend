@@ -13,11 +13,11 @@ import sys
 import gc
 import random
 import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
 
 app = Flask(__name__)
 
 # --- 🔥 SECURITY & CORS 🔥 ---
-# Allow Frontend to send custom header 'x-stark-secret'
 CORS(app, resources={r"/*": {"origins": "*"}}, 
      methods=["GET", "POST", "OPTIONS"],
      allow_headers=["*"],
@@ -35,72 +35,88 @@ def log(msg):
 STARK_SECRET = os.environ.get("STARK_SECRET_KEY", "open_access_mode")
 
 def is_authorized(req):
-    # If secret is not set in env, allow everyone (Debug mode)
     if STARK_SECRET == "open_access_mode": return True
-    
-    # Check Header
     client_key = req.headers.get("x-stark-secret")
-    if client_key == STARK_SECRET:
-        return True
-    return False
+    return client_key == STARK_SECRET
 
-# --- 🔑 KEY ROTATION ---
+# --- 🔑 INTELLIGENT KEY ROTATION ---
 RAW_KEYS = os.environ.get("GEMINI_API_KEYS", "")
+# List of all available keys
 API_KEY_POOL = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
 
-def configure_random_key():
+def get_ai_config_with_rotation(image_paths):
+    """
+    Loops through ALL keys until one works.
+    Stops 429 errors from killing the process.
+    """
     if not API_KEY_POOL:
-        # Fallback to single key if pool is empty
-        single_key = os.environ.get("GEMINI_API_KEY")
-        if single_key:
-            genai.configure(api_key=single_key)
-            return True
-        return False
-    
-    selected_key = random.choice(API_KEY_POOL)
-    genai.configure(api_key=selected_key)
-    log(f"🔑 Rotated Key ending in ...{selected_key[-4:]}")
-    return True
+        log("❌ CRITICAL: No API Keys found!")
+        return None
 
-# --- 🧠 SUPER AI ANALYSIS ---
-def get_ai_config(image_paths):
-    if not configure_random_key(): return None
-    
-    models_to_try = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-flash-latest']
-    
-    for model_name in models_to_try:
+    # Shuffle keys to load balance, but try ALL of them if needed
+    keys_to_try = list(API_KEY_POOL)
+    random.shuffle(keys_to_try)
+
+    # Priority Model
+    MODEL_NAME = 'gemini-2.0-flash'
+
+    for key_index, current_key in enumerate(keys_to_try):
         try:
-            log(f"🤖 Analyzing with {model_name}...")
-            model = genai.GenerativeModel(model_name)
+            # 1. Configure current key
+            masked_key = f"...{current_key[-4:]}"
+            log(f"🔑 Trying Key {key_index + 1}/{len(keys_to_try)} ({masked_key}) on {MODEL_NAME}...")
+            genai.configure(api_key=current_key)
+            
+            # 2. Setup Model
+            model = genai.GenerativeModel(MODEL_NAME)
             content_parts = []
             for path in image_paths:
                 content_parts.append(genai.upload_file(path))
             
-            # --- THE GOD MODE PROMPT ---
+            # 3. Enhanced Prompt (Fixes JSON Escape Error)
             prompt = """
-            Analyze these exam pages deeply. I need to crop individual questions.
-            Return ONLY a JSON object with these fields:
+            Analyze these exam pages. Return ONLY a valid JSON object.
             
-            1. "top_margin": Header height in pixels to safely ignore (e.g., 60).
-            2. "bottom_margin": Footer height in pixels (e.g., 50).
-            3. "regex_pattern": Python Regex to match the Question Number at the start of a line.
-               - Examples: "^Q\\.?[\\s-]?\\s?(\\d+)[\\.\\)]" or "^(\\d+)\\s*[\\.]"
-            4. "is_two_column": Boolean (true/false). Does the layout look like 2 columns?
-            5. "min_question_number": Integer. The first question number visible (usually 1).
+            Fields:
+            1. "top_margin": Header height px (int).
+            2. "bottom_margin": Footer height px (int).
+            3. "regex_pattern": Python Regex string for Question Number at start of line.
+            4. "is_two_column": Boolean (true/false).
             
-            Be precise. If the page is split vertically into two distinct columns of questions, set is_two_column to true.
+            IMPORTANT: 
+            - For Regex, ESCAPE ALL BACKSLASHES. Example: Use "^\\\\d+" instead of "^\\d+".
+            - Use "^Q\\\\.?[\\\\s-]?\\\\s?(\\\\d+)[\\\\.\\\\)]" for "Q.1" format.
+            - Do not include markdown formatting (```json).
             """
             content_parts.append(prompt)
             
+            # 4. Request
             result = model.generate_content(content_parts)
-            text_resp = result.text.replace("```json", "").replace("```", "").strip()
-            data = json.loads(text_resp)
-            log(f"✅ AI Insight: {data}")
-            return data
-        except Exception as e:
-            log(f"❌ {model_name} Error: {str(e)[:50]}...")
-            continue
             
+            # 5. Parse
+            raw_text = result.text.replace("```json", "").replace("```", "").strip()
+            # Clean potential bad escapes if AI ignored instruction
+            # (Basic attempt to fix common single backslash issues in JSON strings)
+            try:
+                data = json.loads(raw_text)
+            except json.JSONDecodeError as je:
+                log(f"⚠️ JSON Parse Error on Key {masked_key}: {je}. Retrying raw fix...")
+                # Last ditch effort: Escape single backslashes that aren't already escaped
+                fixed_text = raw_text.replace(r'\d', r'\\d').replace(r'\s', r'\\s').replace(r'\.', r'\\.')
+                data = json.loads(fixed_text)
+
+            log(f"✅ SUCCESS with Key {masked_key}: {data}")
+            return data
+
+        except google_exceptions.ResourceExhausted:
+            log(f"⚠️ Quota Exceeded (429) on Key {masked_key}. Switching to next key...")
+            continue # Try next key in loop
+            
+        except Exception as e:
+            log(f"❌ Error on Key {masked_key}: {str(e)[:100]}. Switching key just in case...")
+            continue # Try next key (maybe specific key is banned/bad)
+
+    log("💀 ALL KEYS FAILED. Usage limit reached on everything.")
     return None
 
 # --- HELPER FUNCTIONS ---
@@ -111,7 +127,6 @@ def get_pdf_hash(path):
 def extract_questions_with_strategy(doc, strategy_name, config):
     extracted_data = []
     
-    # Unpack Config
     top_m = int(config.get("top_margin", 50))
     bot_m = int(config.get("bottom_margin", 50))
     regex = config.get("regex_pattern")
@@ -122,23 +137,15 @@ def extract_questions_with_strategy(doc, strategy_name, config):
     for page_num in range(len(doc)):
         page = doc[page_num]
         height = page.rect.height
-        mid_x = page.rect.width / 2
         blocks = page.get_text("blocks")
         
         for b in blocks:
             text = b[4].strip()
             bbox = b[:4]
-            x0 = bbox[0]
 
             if bbox[1] < top_m or bbox[3] > height - bot_m: continue 
             if text.startswith("["): continue 
             if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", text, re.I): continue
-
-            # If AI says it's definitely NOT 2 column, enforce strict full width check
-            # Otherwise, keep loose check
-            if not force_two_col and "PANIC" not in strategy_name:
-                 # If text is suspiciously in the middle, might be garbage
-                 pass 
 
             try:
                 q_match = re.search(regex, text, re.IGNORECASE)
@@ -183,8 +190,9 @@ def process_cbt_logic(pdf_path):
     # --- STRATEGY BUILDER ---
     strategies = []
     
-    # 1. AI STRATEGY (High Precision)
-    ai_data = get_ai_config(img_paths)
+    # 1. AI STRATEGY (With True Rotation)
+    ai_data = get_ai_config_with_rotation(img_paths)
+    
     if ai_data:
         strategies.append({
             "name": "GEMINI_GOD_MODE",
@@ -194,12 +202,12 @@ def process_cbt_logic(pdf_path):
             "is_two_column": ai_data.get("is_two_column")
         })
 
-    # 2. FALLBACK STRATEGIES
+    # 2. FALLBACK
     strategies.append({
         "name": "FALLBACK_STD",
         "top_margin": 50, "bottom_margin": 50,
         "regex_pattern": r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]",
-        "is_two_column": False # Assume single unless proven otherwise
+        "is_two_column": False 
     })
     
     strategies.append({
@@ -232,7 +240,6 @@ def process_cbt_logic(pdf_path):
         "generatedBy": f"Team_Stark_{used_strategy}"
     }
 
-    # --- CROP LOGIC WITH AI INTELLIGENCE ---
     force_two_col = active_config.get("is_two_column", False)
 
     for i, q in enumerate(final_questions):
@@ -240,20 +247,14 @@ def process_cbt_logic(pdf_path):
         pg_w = doc[q["page"]].rect.width
         mid_x = pg_w / 2
         
-        # 1. Determine Column Status
-        # If AI said "It's Two Column", we respect that.
-        # OR if the question is literally on the right side.
         is_right_col = q["x0"] > mid_x
         
-        # Determine crop width
         if force_two_col or is_right_col:
-            # Strictly split page in half
             x1 = 0 if not is_right_col else mid_x
             x2 = mid_x if not is_right_col else pg_w
             json_x1 = 5 if not is_right_col else 505
             json_x2 = 495 if not is_right_col else 995
         else:
-            # Single Column (Full Width)
             x1 = 0
             x2 = pg_w
             json_x1 = 5
@@ -264,7 +265,6 @@ def process_cbt_logic(pdf_path):
         if i + 1 < len(final_questions):
             nq = final_questions[i+1]
             if nq["page"] == q["page"]:
-                 # If in same column zone, crop till next question
                  if (force_two_col and (is_right_col == (nq["x0"] > mid_x))) or not force_two_col:
                      next_q_y = nq["y0"] - 15
 
@@ -315,17 +315,16 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Stark Secured Backend V13 (Auth + God Mode) 🔒"
+    return "Stark V14 (Immortal Rotator) 🚀"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
     if request.method == 'OPTIONS':
         return jsonify({"status": "ok"}), 200
 
-    # 🔒 AUTH CHECK
     if not is_authorized(request):
-        log("⛔ Unauthorized Access Attempt Blocked")
-        return jsonify({"error": "Unauthorized: Invalid Stark Secret"}), 403
+        log("⛔ Unauthorized Access")
+        return jsonify({"error": "Unauthorized"}), 403
 
     log("🔵 New Authorized Request Received")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
