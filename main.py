@@ -9,6 +9,7 @@ import re
 from PIL import Image
 import zipfile
 import io
+import sys # For flushing logs
 import google.generativeai as genai
 
 app = Flask(__name__)
@@ -16,88 +17,79 @@ CORS(app)
 
 EXPORT_DIR = "/tmp/cbt_master_package"
 UPLOAD_FOLDER = "/tmp/uploads"
-
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# --- 🔑 GEMINI API CONFIGURATION ---
-# 1500 RPD Free Tier Key (AI Studio)
-GENAI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# --- 🔍 LOGGING HELPER ---
+def log(msg):
+    """Forces print to show up in Railway logs immediately."""
+    print(f"[STARK LOG] {msg}", file=sys.stdout, flush=True)
 
+# --- 🔑 CONFIG ---
+GENAI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GENAI_API_KEY:
     genai.configure(api_key=GENAI_API_KEY)
+    log(f"✅ API Key Loaded: {GENAI_API_KEY[:5]}...******")
+else:
+    log("❌ ERROR: GEMINI_API_KEY missing in Railway Variables!")
 
-# --- 🧠 AI ANALYSIS WITH VALIDATION ---
-def get_layout_config(doc, image_path):
+# --- 🧠 DUAL PAGE AI ANALYSIS ---
+def analyze_with_gemini_dual_page(image_paths):
     """
-    1. Asks AI for config.
-    2. Tests AI config on Page 1 text.
-    3. If AI fails, returns Default Config.
+    Sends up to 2 pages to Gemini to ignore cover sheets and find real questions.
     """
-    
-    # --- DEFAULT CONFIG (The "Desi" Logic) ---
-    # Regex logic: 
-    # ^\s* -> Line start (allow spaces)
-    # (?:Q...)?  -> Optional 'Q', 'Question', 'No'
-    # [\.\s]?    -> Optional dot/space separator
-    # (\d+)      -> THE NUMBER (Capture Group)
-    # [\.\)\-]   -> Must end with dot, bracket, or dash
-    default_config = {
-        "top_margin": 50,
-        "bottom_margin": 50,
-        "regex": r"^\s*(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]",
-        "source": "DEFAULT_FALLBACK"
-    }
-
     if not GENAI_API_KEY:
-        print("⚠️ No API Key. Using Default.")
-        return default_config
+        log("⚠️ Skipping AI: No Key.")
+        return None
 
     try:
-        # 1. Ask Gemini
+        log("🤖 Initiating Gemini 1.5 Flash Session...")
         model = genai.GenerativeModel('gemini-1.5-flash')
-        myfile = genai.upload_file(image_path)
         
+        # Prepare content list (Prompt + Images)
+        content_parts = []
+        
+        # Add Images
+        for path in image_paths:
+            log(f"📤 Uploading Image to AI: {os.path.basename(path)}")
+            file_ref = genai.upload_file(path)
+            content_parts.append(file_ref)
+        
+        # The Prompt
         prompt = """
-        Analyze this exam page. I need to crop questions via Python Regex.
-        Return ONLY a JSON object.
-        1. "top_margin": Header height in pixels (approx).
-        2. "bottom_margin": Footer height in pixels (approx).
-        3. "regex_pattern": Python Regex to capture the Question Number at the start of a line.
-           Examples:
-           - "Q.1" -> "^Q\\.?\\s*(\\d+)[\\.\\)]"
-           - "1 ." -> "^(\\d+)\\s*[\\.]"
-           - "(1)" -> "^\\((\\d+)\\)"
+        I have provided images of the first 1-2 pages of an exam PDF.
+        Page 1 might be a cover sheet/instructions. Look at BOTH pages to find the actual question format.
+        
+        I need to crop questions using Python Regex. Return ONLY a JSON object:
+        1. "top_margin": Height in pixels of header to ignore (e.g. 60).
+        2. "bottom_margin": Height in pixels of footer to ignore (e.g. 50).
+        3. "regex_pattern": The Python Regex to capture the Question Number at start of a line.
+           - If questions look like "Q.1", return "^Q\\.?[\\s-]?\\s?(\\d+)[\\.\\)]"
+           - If questions look like "1 .", return "^(\\d+)\\s*[\\.]"
+           - If questions look like "(1)", return "^\\((\\d+)\\)"
+           - If questions look like "Q1", return "^Q\\s?(\\d+)"
+        
+        IMPORTANT: Do not match equation numbers like "eq(1)" or option numbers like "(1)". match strictly START of line labels.
         """
+        content_parts.append(prompt)
+
+        log("🚀 Sending Request to Gemini...")
+        result = model.generate_content(content_parts)
         
-        result = model.generate_content([myfile, prompt])
-        text_resp = result.text.replace("```json", "").replace("```", "").strip()
-        ai_data = json.loads(text_resp)
+        # Parse Response
+        raw_text = result.text
+        log(f"📥 Raw Gemini Response: {raw_text[:100]}...") # Print first 100 chars
         
-        ai_regex = ai_data.get("regex_pattern", "")
+        clean_text = raw_text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(clean_text)
         
-        # 2. VALIDATION STEP (Crucial!)
-        # Check if AI regex actually finds anything on Page 1
-        page1_text = doc[0].get_text()
-        matches = re.findall(ai_regex, page1_text, re.MULTILINE)
-        
-        if len(matches) > 0:
-            print(f"✅ AI Regex Validated! Found {len(matches)} matches on Page 1.")
-            return {
-                "top_margin": int(ai_data.get("top_margin", 50)),
-                "bottom_margin": int(ai_data.get("bottom_margin", 50)),
-                "regex": ai_regex,
-                "source": "GEMINI_AI"
-            }
-        else:
-            print(f"❌ AI Regex '{ai_regex}' found 0 matches. Reverting to Default.")
-            return default_config
+        log(f"✅ Parsed AI Config: {data}")
+        return data
 
     except Exception as e:
-        print(f"⚠️ AI Error: {e}. Using Default.")
-        return default_config
+        log(f"❌ Gemini Crash: {str(e)}")
+        return None
 
 # --- HELPER FUNCTIONS ---
-
 def get_pdf_hash(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -109,31 +101,48 @@ def process_cbt_logic(pdf_path):
     SECTION_NAME = "Stark"
     SUBJECT_NAME = "Stark"
     
-    # Load PDF
+    # 1. PREPARE IMAGES (First 2 Pages)
     doc = fitz.open(pdf_path)
+    pages_to_check = min(2, len(doc))
+    img_paths = []
     
-    # Generate Page 1 Image for AI
-    page1 = doc[0]
-    pix = page1.get_pixmap(dpi=150)
-    img_path = os.path.join(UPLOAD_FOLDER, "analyze_page.jpg")
-    pix.save(img_path)
+    log(f"📸 Generating images for first {pages_to_check} pages...")
     
-    # GET SMART CONFIG (AI or Fallback)
-    config = get_layout_config(doc, img_path)
+    for i in range(pages_to_check):
+        page = doc[i]
+        pix = page.get_pixmap(dpi=150)
+        p_path = os.path.join(UPLOAD_FOLDER, f"analyze_page_{i}.jpg")
+        pix.save(p_path)
+        img_paths.append(p_path)
     
-    TOP_MARGIN = config["top_margin"]
-    BOTTOM_MARGIN = config["bottom_margin"]
-    MASTER_REGEX = config["regex"]
+    # 2. ASK AI
+    ai_config = analyze_with_gemini_dual_page(img_paths)
     
-    print(f"🚀 Processing with [{config['source']}] | Regex: {MASTER_REGEX}")
+    # 3. SET CONFIG
+    if ai_config:
+        TOP_MARGIN = int(ai_config.get("top_margin", 60))
+        BOTTOM_MARGIN = int(ai_config.get("bottom_margin", 50))
+        MASTER_REGEX = ai_config.get("regex_pattern")
+        SOURCE = "GEMINI_AI"
+    else:
+        log("⚠️ Using Fallback Config.")
+        TOP_MARGIN = 60
+        BOTTOM_MARGIN = 50
+        MASTER_REGEX = r"^(?:(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-])"
+        SOURCE = "FALLBACK_LOGIC"
+
+    log(f"⚙️ FINAL CONFIG | Source: {SOURCE} | Regex: {MASTER_REGEX} | Top: {TOP_MARGIN}")
 
     data_json = {
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
         "pdfCropperData": {SUBJECT_NAME: {SECTION_NAME: {}}},
         "appVersion": "1.30.0",
-        "generatedBy": f"Team_Stark_{config['source']}"
+        "generatedBy": f"Team_Stark_{SOURCE}"
     }
 
+    # 4. PROCESS PAGES
+    total_q_found = 0
+    
     for page_num in range(len(doc)):
         page = doc[page_num]
         width, height = page.rect.width, page.rect.height
@@ -148,53 +157,44 @@ def process_cbt_logic(pdf_path):
             bbox = b[:4]
             x0 = bbox[0]
             
-            # --- FILTER 1: MARGINS ---
-            if bbox[1] < TOP_MARGIN or bbox[3] > height - BOTTOM_MARGIN:
-                continue
-
-            # --- FILTER 2: X-AXIS LOCK (Safety Net) ---
-            # If text is too far right (indented), it's likely an equation/option
+            if bbox[1] < TOP_MARGIN or bbox[3] > height - BOTTOM_MARGIN: continue
+            
+            # Strict X-Axis Lock (Even with AI, prevent side-notes)
             if x0 > 80 and x0 < mid_x: continue
             if x0 > mid_x + 80: continue
 
-            # --- FILTER 3: COMMON NOISE ---
             if text.startswith("["): continue 
             if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", text, re.I): continue
 
             try:
-                # Use the Selected Regex
                 q_match = re.search(MASTER_REGEX, text, re.IGNORECASE)
-                
                 if q_match:
-                    if any(x in text for x in ["Answer", "Solution", "Page", "Total", "Notes"]): continue
+                    if any(x in text for x in ["Answer", "Solution", "Page", "Total"]): continue
                     
-                    # Extract Number safely
                     q_no_str = None
                     for group in q_match.groups():
-                        if group:
+                        if group: 
                             q_no_str = group
                             break
                     
                     if not q_no_str: continue
 
-                    # Range Check
                     try:
                         q_val = int(q_no_str)
                         if q_val <= 0 or q_val > 500: continue
-                    except:
-                        continue
+                    except: continue
 
                     all_q.append({"label": q_no_str, "x0": bbox[0], "y0": bbox[1]})
-                    
                     if bbox[0] > mid_x + 30: is_multi_column = True
-            except:
-                continue
+            except: continue
 
         if not all_q: 
-            print(f"Page {page_num+1}: No questions found.")
+            # log(f"Page {page_num+1}: 0 Questions.") # Commented to reduce noise
             continue
+        
+        total_q_found += len(all_q)
 
-        # Sort & Columns logic
+        # Columns & Crop Logic...
         if is_multi_column:
             left_col = sorted([q for q in all_q if q['x0'] < mid_x], key=lambda x: x['y0'])
             right_col = sorted([q for q in all_q if q['x0'] >= mid_x], key=lambda x: x['y0'])
@@ -241,7 +241,8 @@ def process_cbt_logic(pdf_path):
                 img_name = f"{SECTION_NAME}__--__{q_id}__--__1.png"
                 cropped.save(os.path.join(EXPORT_DIR, img_name))
 
-    # ZIP Creation
+    log(f"🏁 Processing Complete. Total Questions: {total_q_found}")
+    
     with open(os.path.join(EXPORT_DIR, "data.json"), "w") as f:
         json.dump(data_json, f, indent=2)
 
@@ -255,17 +256,17 @@ def process_cbt_logic(pdf_path):
     return memory_file
 
 # --- FLASK ROUTES ---
-
 @app.route('/')
 def home():
-    return "Team Stark Backend (Fail-Safe) is LIVE! 🚀"
+    return "Stark Backend with Live Logs 🚀"
 
 @app.route('/process', methods=['POST'])
 def upload_file():
+    log("🔵 New Request Received")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['pdf']
     if file.filename == '': return jsonify({"error": "No selected file"}), 400
-
+    
     if file:
         filepath = os.path.join(UPLOAD_FOLDER, file.filename)
         file.save(filepath)
@@ -273,7 +274,7 @@ def upload_file():
             zip_buffer = process_cbt_logic(filepath)
             return send_file(zip_buffer, mimetype='application/zip', as_attachment=True, download_name='Stark_Result.zip')
         except Exception as e:
-            print(f"ERROR: {str(e)}")
+            log(f"🔥 CRITICAL ERROR: {str(e)}")
             return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
