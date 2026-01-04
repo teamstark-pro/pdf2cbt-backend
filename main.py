@@ -38,7 +38,7 @@ def is_authorized(req):
     client_key = req.headers.get("x-stark-secret")
     return client_key == STARK_SECRET
 
-# --- ⚡ GROQ VISION CLIENT ---
+# --- ⚡ GROQ VISION CLIENT (Llama 4) ---
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 client = None
 if GROQ_API_KEY:
@@ -54,12 +54,12 @@ def encode_image(image_path):
 def get_ai_config(image_paths):
     if not client: return None
     
-    # Groq Llama 3.2 Vision Model
-    MODEL_NAME = "llama-3.2-11b-vision-preview"
+    # 🔥 UPDATED MODEL: Llama 4 Scout 🔥
+    MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
     
     try:
-        # We only take the first image for analysis to save tokens/complexity
-        # (Llama 3.2 handles single image context best right now)
+        # We process the first image. 
+        # Note: Llama 4 has a 4MB Base64 limit. Our DPI=100 ensures we stay well below (~0.5MB).
         base64_image = encode_image(image_paths[0])
         
         log(f"🤖 Asking Groq ({MODEL_NAME}) to analyze layout...")
@@ -73,10 +73,10 @@ def get_ai_config(image_paths):
                         {
                             "type": "text",
                             "text": """
-                            You are a PDF Layout Analyzer. Look at this exam page image.
+                            You are an expert PDF Layout Analyzer. Look at this exam page image.
                             I need to crop questions automatically.
                             
-                            Return ONLY a valid JSON object with no markdown formatting.
+                            Return ONLY a valid JSON object with no markdown formatting or backticks.
                             Keys required:
                             1. "top_margin": Integer (Height in pixels of header to ignore. usually 50-100).
                             2. "bottom_margin": Integer (Height in pixels of footer to ignore. usually 50).
@@ -97,11 +97,11 @@ def get_ai_config(image_paths):
                     ]
                 }
             ],
-            temperature=0.1, # Low temp for precise JSON
+            temperature=0.1, 
             max_tokens=512,
             top_p=1,
             stream=False,
-            response_format={"type": "json_object"} # Force JSON mode
+            response_format={"type": "json_object"}
         )
         
         resp_content = completion.choices[0].message.content
@@ -174,11 +174,11 @@ def process_cbt_logic(pdf_path):
     
     doc = fitz.open(pdf_path)
     
-    # Generate Images (Low DPI)
+    # Generate Images (DPI 100 for Speed & Size Safety)
     pages_to_check = min(2, len(doc))
     img_paths = []
     for i in range(pages_to_check):
-        pix = doc[i].get_pixmap(dpi=150) # Better DPI for Vision
+        pix = doc[i].get_pixmap(dpi=100) # Safe DPI for 4MB limit
         p_path = os.path.join(UPLOAD_FOLDER, f"analyze_page_{i}.jpg")
         pix.save(p_path)
         img_paths.append(p_path)
@@ -186,11 +186,11 @@ def process_cbt_logic(pdf_path):
     # Strategies
     strategies = []
     
-    # 1. GROQ AI STRATEGY
+    # 1. GROQ LLAMA 4 STRATEGY
     ai_data = get_ai_config(img_paths)
     if ai_data:
         strategies.append({
-            "name": "GROQ_LLAMA_VISION",
+            "name": "GROQ_LLAMA_4_SCOUT",
             "top_margin": ai_data.get("top_margin", 60),
             "bottom_margin": ai_data.get("bottom_margin", 50),
             "regex_pattern": ai_data.get("regex_pattern"),
@@ -311,7 +311,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark Groq Vision Backend 🚀"
+    return "Team Stark Groq Llama-4 Backend 🚀"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
@@ -322,7 +322,7 @@ def upload_file():
         log("⛔ Unauthorized")
         return jsonify({"error": "Unauthorized"}), 403
 
-    log("🔵 New Authorized Request Received (Groq)")
+    log("🔵 New Authorized Request Received (Llama 4)")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['pdf']
     
