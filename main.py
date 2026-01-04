@@ -10,10 +10,19 @@ from PIL import Image
 import zipfile
 import io
 import sys
+import gc  # Garbage Collector for RAM
 import google.generativeai as genai
 
 app = Flask(__name__)
-CORS(app)
+
+# --- 🔥 CORS FIX FOR TABLETS/MOBILE 🔥 ---
+# "origins": "*" -> Sabko allow karo
+# "allow_headers": "*" -> Saare headers allow karo
+# "expose_headers" -> Filename read karne ke liye zaroori hai
+CORS(app, resources={r"/*": {"origins": "*"}}, 
+     methods=["GET", "POST", "OPTIONS"],
+     allow_headers=["*"],
+     expose_headers=["Content-Disposition", "Content-Type"])
 
 EXPORT_DIR = "/tmp/cbt_master_package"
 UPLOAD_FOLDER = "/tmp/uploads"
@@ -32,12 +41,12 @@ if GENAI_API_KEY:
 def get_ai_config(image_paths):
     if not GENAI_API_KEY: return None
     
-    # 🔥 UPDATED MODELS BASED ON YOUR LOGS 🔥
+    # Updated Model List
     models_to_try = [
-        'gemini-2.0-flash',       # Latest Fast Model
-        'gemini-2.5-flash',       # Preview Model
-        'gemini-flash-latest',    # Auto-latest
-        'gemini-2.0-flash-lite'   # Super cheap/fast
+        'gemini-2.0-flash', 
+        'gemini-2.5-flash', 
+        'gemini-flash-latest',
+        'gemini-1.5-flash'
     ]
     
     for model_name in models_to_try:
@@ -53,7 +62,7 @@ def get_ai_config(image_paths):
             1. "top_margin": Header height px (e.g. 60).
             2. "bottom_margin": Footer height px (e.g. 50).
             3. "regex_pattern": Regex for Question Start. 
-               Ex: "^Q\\.?[\\s-]?\\s?(\\d+)[\\.\\)]" or "^(\\d+)\\s*[\\.]"
+               Ex: "^Q\\.?[\\s-]?\\s?(\\d+)[\\.\\)]"
             """
             content_parts.append(prompt)
             
@@ -63,7 +72,7 @@ def get_ai_config(image_paths):
             log(f"✅ AI Success ({model_name}): {data}")
             return data
         except Exception as e:
-            log(f"❌ {model_name} Error: {str(e)[:100]}") # Keep log short
+            log(f"❌ {model_name} Error: {str(e)[:50]}...")
             continue
             
     return None
@@ -92,7 +101,7 @@ def extract_questions_with_strategy(doc, strategy_name, top_m, bot_m, regex_patt
             if text.startswith("["): continue 
             if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", text, re.I): continue
 
-            # Indentation Check (Loose for Panic Mode)
+            # Loose X-Check
             if "PANIC" not in strategy_name:
                 if x0 > 80 and x0 < mid_x: continue 
                 if x0 > mid_x + 80: continue
@@ -128,19 +137,17 @@ def process_cbt_logic(pdf_path):
     
     doc = fitz.open(pdf_path)
     
-    # Images for AI
+    # Images for AI (Low DPI to save RAM)
     pages_to_check = min(2, len(doc))
     img_paths = []
     for i in range(pages_to_check):
-        pix = doc[i].get_pixmap(dpi=150)
+        pix = doc[i].get_pixmap(dpi=100) # Reduced DPI for RAM safety
         p_path = os.path.join(UPLOAD_FOLDER, f"analyze_page_{i}.jpg")
         pix.save(p_path)
         img_paths.append(p_path)
 
     # Strategies
     strategies = []
-    
-    # Strategy 1: AI (With corrected Model Names)
     ai_data = get_ai_config(img_paths)
     if ai_data:
         strategies.append({
@@ -150,14 +157,12 @@ def process_cbt_logic(pdf_path):
             "regex": ai_data.get("regex_pattern")
         })
 
-    # Strategy 2: Standard Fallback
     strategies.append({
         "name": "FALLBACK_STANDARD",
         "top": 50, "bot": 50,
         "regex": r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]"
     })
     
-    # Strategy 3: Panic Mode
     strategies.append({
         "name": "PANIC_MODE",
         "top": 0, "bot": 0,
@@ -185,35 +190,28 @@ def process_cbt_logic(pdf_path):
         "generatedBy": f"Team_Stark_{used_strategy}"
     }
 
-    # --- PROCESS AND CROP ---
+    # Process and Crop
     for i, q in enumerate(final_questions):
         pg_h = doc[q["page"]].rect.height
         pg_w = doc[q["page"]].rect.width
         mid_x = pg_w / 2
         
-        # --- SMART COLUMN DETECTION ---
-        # Check if ANY question on this page is on the right side
+        # Smart Column Detection
+        is_right_col = q["x0"] > mid_x
         page_qs = [xq for xq in final_questions if xq["page"] == q["page"]]
         has_right_col = any(xq["x0"] > mid_x + 20 for xq in page_qs)
         
-        # If no questions on right side, it's SINGLE COLUMN -> Use Full Width
-        is_right_col = q["x0"] > mid_x
-        
-        # Determine X Coordinates
         if has_right_col:
-            # Multi-column Logic
             x1 = 0 if not is_right_col else mid_x
             x2 = mid_x if not is_right_col else pg_w
             json_x1 = 5 if not is_right_col else 505
             json_x2 = 495 if not is_right_col else 995
         else:
-            # Single Column Logic (FULL WIDTH)
             x1 = 0
             x2 = pg_w
             json_x1 = 5
             json_x2 = 995
 
-        # Determine Y Coordinates
         next_q_y = pg_h - 50 
         
         if i + 1 < len(final_questions):
@@ -222,12 +220,10 @@ def process_cbt_logic(pdf_path):
                  if not has_right_col or (is_right_col == (nq["x0"] > mid_x)):
                      next_q_y = nq["y0"] - 15
 
-        # Coordinate Guard
         y1_crop = max(0, q["y0"] - 30)
         y2_crop = min(pg_h, next_q_y + 10)
         if y2_crop <= y1_crop: y2_crop = y1_crop + 200
 
-        # JSON Coords
         data_json["pdfCropperData"][SUBJECT_NAME][SECTION_NAME][str(q["label"])] = {
             "que": q["label"], "type": "mcq", "marks": {"cm": 4, "im": -1},
             "pdfData": [{
@@ -239,27 +235,29 @@ def process_cbt_logic(pdf_path):
             "answerOptions": "4"
         }
 
-        # Image Crop
+        # Memory Efficient Crop
         page = doc[q["page"]]
-        pix = page.get_pixmap(dpi=300)
+        pix = page.get_pixmap(dpi=200) # Lower DPI for output to save RAM
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         
         scale_w = pix.width / pg_w
         scale_h = pix.height / pg_h
         
-        crop_box = (
-            x1 * scale_w, 
-            y1_crop * scale_h,
-            x2 * scale_w, 
-            y2_crop * scale_h
-        )
+        crop_box = (x1 * scale_w, y1_crop * scale_h, x2 * scale_w, y2_crop * scale_h)
         
         try:
             cropped = img.crop(crop_box)
             img_name = f"{SECTION_NAME}__--__{q['label']}__--__1.png"
             cropped.save(os.path.join(EXPORT_DIR, img_name))
-        except Exception as e:
-            log(f"❌ Crop Failed Q{q['label']}: {e}")
+        except: pass
+        
+        # Free Memory
+        del img
+        del pix
+
+    # Explicit Garbage Collection
+    doc.close()
+    gc.collect()
 
     # ZIP
     with open(os.path.join(EXPORT_DIR, "data.json"), "w") as f:
@@ -277,14 +275,17 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark V11 (Gemini 2.0 Integrated) 🚀"
+    return "Team Stark V11 (Mobile/Tab Ready) 🚀"
 
-@app.route('/process', methods=['POST'])
+@app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
+    if request.method == 'OPTIONS':
+        # Pre-flight request for Tablets
+        return jsonify({"status": "ok"}), 200
+
     log("🔵 New Request Received")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['pdf']
-    if file.filename == '': return jsonify({"error": "No selected file"}), 400
     
     if file:
         filepath = os.path.join(UPLOAD_FOLDER, file.filename)
