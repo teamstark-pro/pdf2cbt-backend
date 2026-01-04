@@ -52,30 +52,29 @@ def encode_image(image_path):
 def get_questions_per_page_batch(image_paths):
     """
     Sends a batch of images (max 2) to Groq.
-    Asks ONLY for the Question Numbers present.
-    Example Response: {"img_0": [1, 2], "img_1": [3, 4]}
+    Asks ONLY for the Question Numbers present, explicitly ignoring solutions.
     """
     if not client or not image_paths: return None
     
     MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
     
     try:
-        # Build Message
         message_content = [
             {
                 "type": "text",
                 "text": """
-                Analyze these exam pages. Identify ONLY the Question Numbers present (e.g., 1, 2, 35).
+                Analyze these exam pages. Identify ONLY the Question Numbers for actual QUESTIONS.
                 
-                RULES:
-                1. IGNORE numbers inside 'Solution', 'Answer', or 'Example' blocks.
-                2. IGNORE page numbers or marks.
-                3. ONLY return the integer number of the question.
+                CRITICAL RULES:
+                1. IGNORE any block labeled "Solution", "Answer", "Correct Answer", "Sol.", "Ans".
+                   (Example: If you see "Q18. Solution", DO NOT include 18).
+                2. IGNORE page numbers, marks, or section headers.
+                3. ONLY return integers of valid questions to be solved.
                 
                 Return JSON mapping image index to list of numbers:
                 {
                     "img_0": [1, 2, 3],
-                    "img_1": [4, 5]
+                    "img_1": [] 
                 }
                 
                 Output JSON ONLY.
@@ -92,7 +91,6 @@ def get_questions_per_page_batch(image_paths):
                 }
             })
         
-        # API Call
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[{"role": "user", "content": message_content}],
@@ -115,26 +113,27 @@ def get_pdf_hash(path):
 def extract_questions_with_ai_guide(doc, page_map_guidance):
     extracted_data = []
     
-    # Standard Regex for hunting (Verified by AI list)
-    # Matches: "1.", "Q1", "Q.1", "(1)"
+    # 1. Standard Regex for hunting
     regex_list = [
         r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]",
         r"^(\d+)\s*[\.\)]"
     ]
     
-    # Safe Margins (Standardized)
+    # 2. THE ANTI-SOLUTION SHIELD (Python Layer)
+    # If text contains these, we skip it even if AI said "Yes"
+    BAD_KEYWORDS = [
+        "Solution", "Sol.", "Answer", "Ans.", "Correct Answer", 
+        "Explanation", "Hint", "Step 1", "Hence", "Therefore"
+    ]
+    
     top_m = 50
     bot_m = 50
     
     for page_num in range(len(doc)):
-        # Check if AI found any questions on this page
         allowed_numbers = page_map_guidance.get(page_num, [])
         if not allowed_numbers:
-            log(f"⚠️ AI says Page {page_num+1} has NO questions. Skipping.")
             continue
             
-        log(f"🔍 Page {page_num+1}: Hunting for Qs {allowed_numbers}...")
-        
         page = doc[page_num]
         height = page.rect.height
         blocks = page.get_text("blocks")
@@ -144,9 +143,15 @@ def extract_questions_with_ai_guide(doc, page_map_guidance):
             bbox = b[:4]
             x0, y0, x1, y1 = bbox
             
+            # Margins
             if y0 < top_m or y1 > height - bot_m: continue
             
-            # --- THE HYBRID CHECK ---
+            # --- 🔥 FILTER: REJECT SOLUTIONS 🔥 ---
+            if any(bad in text for bad in BAD_KEYWORDS):
+                # log(f"   -> Skipped Solution Block: '{text[:20]}...'")
+                continue
+
+            # --- HYBRID CHECK ---
             match_found = False
             for pat in regex_list:
                 try:
@@ -157,7 +162,7 @@ def extract_questions_with_ai_guide(doc, page_map_guidance):
                         
                         q_val = int(q_no_str)
                         
-                        # CRITICAL: Is this number in AI's allowed list?
+                        # Verify against AI List
                         if q_val in allowed_numbers:
                             extracted_data.append({
                                 "label": q_no_str, 
@@ -165,8 +170,6 @@ def extract_questions_with_ai_guide(doc, page_map_guidance):
                                 "page": page_num, 
                                 "bbox": bbox
                             })
-                            # Remove from list so we don't find duplicates/shadows
-                            # allowed_numbers.remove(q_val) 
                             match_found = True
                             break
                 except: continue
@@ -185,50 +188,41 @@ def process_cbt_logic(pdf_path):
     total_pages = len(doc)
     
     # --- STEP 1: BATCH PROCESSING WITH GROQ ---
-    # Map: { page_index: [1, 2, 3] }
     FULL_PAGE_GUIDANCE = {}
-    
     BATCH_SIZE = 2
     
     for i in range(0, total_pages, BATCH_SIZE):
         batch_indices = range(i, min(i + BATCH_SIZE, total_pages))
         img_paths = []
         
-        log(f"🤖 Processing Batch: Pages {[b+1 for b in batch_indices]}...")
+        log(f"🤖 Processing Pages {[b+1 for b in batch_indices]}...")
         
-        # Generate Images
         for p_idx in batch_indices:
             pix = doc[p_idx].get_pixmap(dpi=100)
             path = os.path.join(UPLOAD_FOLDER, f"batch_page_{p_idx}.jpg")
             pix.save(path)
             img_paths.append(path)
             
-        # Ask Groq
         batch_data = get_questions_per_page_batch(img_paths)
         
-        # Map back to global page index
         if batch_data:
             for rel_idx, key in enumerate(sorted(batch_data.keys())):
                 if rel_idx < len(batch_indices):
                     global_page_idx = batch_indices[rel_idx]
                     found_qs = [int(x) for x in batch_data[key] if isinstance(x, (int, str)) and str(x).isdigit()]
                     FULL_PAGE_GUIDANCE[global_page_idx] = found_qs
-                    log(f"   -> Page {global_page_idx+1}: Found Qs {found_qs}")
+                    if found_qs:
+                        log(f"   -> Page {global_page_idx+1}: Qs {found_qs}")
         
-        # Rate Limit Safety (Tiny sleep)
         time.sleep(0.5)
 
-    # --- STEP 2: EXTRACT USING AI GUIDANCE ---
+    # --- STEP 2: EXTRACT USING AI GUIDANCE + FILTER ---
     final_questions = extract_questions_with_ai_guide(doc, FULL_PAGE_GUIDANCE)
 
     # --- FAILSAFE ---
     if not final_questions:
-        log("⚠️ AI didn't return any numbers. Falling back to Standard Mode.")
-        # Fallback logic here if needed, or error out
-        # Re-using strict logic just in case
-        config = {"top_margin": 50, "bottom_margin": 50, "left_margin": 0}
-        # (Assuming you kept the old strict function, or just fail)
-        raise Exception("AI found no questions. PDF might be text-only without numbers.")
+        log("⚠️ AI found nothing. Checking for text-only PDF or Encryption.")
+        raise Exception("No valid questions found (Solutions skipped).")
 
     log(f"✅ Total Verified Questions: {len(final_questions)}")
 
@@ -237,26 +231,22 @@ def process_cbt_logic(pdf_path):
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
         "pdfCropperData": {SUBJECT_NAME: {SECTION_NAME: {}}},
         "appVersion": "1.30.0",
-        "generatedBy": "Team_Stark_Groq_PageByPage"
+        "generatedBy": "Team_Stark_V26_AntiSolution"
     }
 
-    # Sorting
     final_questions.sort(key=lambda x: (x["page"], x["y0"]))
 
     for i, q in enumerate(final_questions):
         pg_h = doc[q["page"]].rect.height
         pg_w = doc[q["page"]].rect.width
         
-        # Full width crop (Safest)
         x1 = 0
         x2 = pg_w
         json_x1 = 5
         json_x2 = 995
 
-        # Determine height
         next_q_y = pg_h - 50 
         
-        # Look for next question on SAME page
         for j in range(i + 1, len(final_questions)):
             if final_questions[j]["page"] == q["page"]:
                 next_q_y = final_questions[j]["y0"] - 15
@@ -277,7 +267,6 @@ def process_cbt_logic(pdf_path):
             "answerOptions": "4"
         }
 
-        # Crop Image
         page = doc[q["page"]]
         pix = page.get_pixmap(dpi=200)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -310,7 +299,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark V25 (Page-by-Page AI Supervisor) 🚀"
+    return "Team Stark V26 (Anti-Solution Shield) 🚀"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
@@ -320,7 +309,7 @@ def upload_file():
     if not is_authorized(request):
         return jsonify({"error": "Unauthorized"}), 403
 
-    log("🔵 New Request (Page-by-Page Scan)")
+    log("🔵 New Request (Page-by-Page + Shield)")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['pdf']
     
