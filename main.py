@@ -54,30 +54,29 @@ def get_ai_config(image_paths):
     MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
     
     try:
-        log(f"🤖 Groq DNA Scan on {len(image_paths)} pages ({MODEL_NAME})...")
+        log(f"🤖 Scanning {len(image_paths)} pages for Layout DNA...")
         
-        # --- Build Dynamic Message Content for Multiple Images ---
         message_content = [
             {
                 "type": "text",
                 "text": """
-                Analyze these first few pages of an exam PDF to determine the overall layout structure.
-                Return ONLY a valid JSON object defining global parameters for cropping.
+                Analyze these exam pages to find the GLOBAL layout for the whole document.
+                Ignore cover pages or instruction pages when deciding margins. Focus on the main Question Pages.
                 
-                1. "top_margin": Int (Pixels to ignore at top header area across pages. e.g. 60).
-                2. "bottom_margin": Int (Pixels to ignore at bottom footer area across pages. e.g. 50).
-                3. "left_margin": Int (Pixels to ignore from left margin. e.g. 20).
-                4. "regex_pattern": Python Regex for Question Start found consistently. 
+                Return ONLY a valid JSON object:
+                1. "top_margin": Int (Safe header height to ignore. Max 150. Default 50).
+                2. "bottom_margin": Int (Safe footer height to ignore. Max 100. Default 50).
+                3. "left_margin": Int (Left margin to ignore line numbers. Default 0).
+                4. "regex_pattern": Python Regex for Question Start (e.g. ^Q\\.?\\s*(\\d+)). 
                    - ESCAPE BACKSLASHES (e.g. ^\\\\d+).
-                5. "is_two_column": Boolean (true if layout is generally 2 columns).
-                6. "ignore_words": List of strings to exclude typically found in headers/footers.
+                5. "is_two_column": Boolean (True if most pages have 2 vertical columns).
+                6. "ignore_words": List[String] (Words in headers/footers to explicitly ignore).
                 
-                Output JSON only. No markdown.
+                Output JSON only.
                 """
             }
         ]
         
-        # Add all up to 5 images to the payload
         for path in image_paths:
             base64_img = encode_image(path)
             message_content.append({
@@ -87,29 +86,19 @@ def get_ai_config(image_paths):
                 }
             })
         
-        # Send Request
         completion = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[
-                {
-                    "role": "user",
-                    "content": message_content
-                }
-            ],
-            temperature=0.1, 
-            max_tokens=800,
-            top_p=1,
-            stream=False,
+            messages=[{"role": "user", "content": message_content}],
+            temperature=0.1, max_tokens=800, top_p=1, stream=False,
             response_format={"type": "json_object"}
         )
         
-        resp_content = completion.choices[0].message.content
-        data = json.loads(resp_content)
-        log(f"✅ Multi-Page DNA Extracted: {data}")
+        data = json.loads(completion.choices[0].message.content)
+        log(f"✅ AI Config: {data}")
         return data
 
     except Exception as e:
-        log(f"❌ Groq Error: {str(e)}")
+        log(f"❌ AI Analysis Failed: {str(e)}")
         return None
 
 # --- HELPER FUNCTIONS ---
@@ -120,60 +109,66 @@ def get_pdf_hash(path):
 def extract_questions_with_strategy(doc, strategy_name, config):
     extracted_data = []
     
-    # Unpack Config
-    top_m = int(config.get("top_margin", 50))
-    bot_m = int(config.get("bottom_margin", 50))
+    # --- SAFETY CLAMPING (Prevent Cut-offs) ---
+    # Agar AI ne margin 500 bol diya, toh hum usse 150 par rok denge
+    top_m = min(int(config.get("top_margin", 50)), 180)
+    bot_m = min(int(config.get("bottom_margin", 50)), 150)
     left_m = int(config.get("left_margin", 0))
+    
     ai_regex = config.get("regex_pattern", "")
     ignore_words = config.get("ignore_words", [])
     
-    # 🔥 HYBRID REGEX LIST 🔥
+    # Hybrid Regex List
     regex_list = []
-    if ai_regex: regex_list.append(ai_regex) # Priority 1: AI
-    regex_list.append(r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]") # Priority 2: Standard
-    regex_list.append(r"^(\d+)\s*[\.\)]") # Priority 3: Loose
+    if ai_regex: regex_list.append(ai_regex)
+    regex_list.append(r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]")
+    regex_list.append(r"^(\d+)\s*[\.\)]")
 
-    log(f"🔄 Strategy: {strategy_name} | Margins: T{top_m}/B{bot_m}/L{left_m}")
+    log(f"🔄 Running {strategy_name} on {len(doc)} pages... (Margins: T{top_m}/B{bot_m})")
 
     for page_num in range(len(doc)):
-        page = doc[page_num]
-        height = page.rect.height
-        blocks = page.get_text("blocks")
-        
-        for b in blocks:
-            text = b[4].strip()
-            bbox = b[:4]
-            x0, y0, x1, y1 = bbox
-
-            # --- FILTERS ---
-            if y0 < top_m or y1 > height - bot_m: continue
-            if x0 < left_m: continue 
+        try:
+            page = doc[page_num]
+            height = page.rect.height
+            blocks = page.get_text("blocks")
             
-            if any(w.lower() in text.lower() for w in ignore_words): continue
-            if text.startswith("[") or re.search(r"@[a-z]+\.", text, re.I): continue
+            for b in blocks:
+                text = b[4].strip()
+                bbox = b[:4]
+                x0, y0, x1, y1 = bbox
 
-            # --- HYBRID MATCHING ---
-            for pat in regex_list:
-                try:
-                    q_match = re.search(pat, text, re.IGNORECASE)
-                    if q_match:
-                        if any(x in text for x in ["Answer", "Solution", "Page", "Total"]): continue
-                        q_no_str = next((g for g in q_match.groups() if g), None)
-                        if not q_no_str: continue
-                        
-                        try:
-                            q_val = int(q_no_str)
-                            if q_val <= 0 or q_val > 500: continue
-                        except: continue
+                # Filters
+                if y0 < top_m or y1 > height - bot_m: continue
+                if x0 < left_m: continue
+                
+                if any(w.lower() in text.lower() for w in ignore_words): continue
+                if text.startswith("[") or re.search(r"@[a-z]+\.", text, re.I): continue
 
-                        extracted_data.append({
-                            "label": q_no_str, 
-                            "x0": x0, "y0": y0, 
-                            "page": page_num, 
-                            "bbox": bbox
-                        })
-                        break # Found match, move to next block
-                except: continue
+                # Regex Check
+                for pat in regex_list:
+                    try:
+                        q_match = re.search(pat, text, re.IGNORECASE)
+                        if q_match:
+                            if any(x in text for x in ["Answer", "Solution", "Page", "Total"]): continue
+                            q_no_str = next((g for g in q_match.groups() if g), None)
+                            if not q_no_str: continue
+                            
+                            try:
+                                q_val = int(q_no_str)
+                                if q_val <= 0 or q_val > 500: continue
+                            except: continue
+
+                            extracted_data.append({
+                                "label": q_no_str, 
+                                "x0": x0, "y0": y0, 
+                                "page": page_num, 
+                                "bbox": bbox
+                            })
+                            break
+                    except: continue
+        except Exception as e:
+            log(f"⚠️ Error reading page {page_num}: {e}")
+            continue
             
     return extracted_data
 
@@ -186,20 +181,18 @@ def process_cbt_logic(pdf_path):
     
     doc = fitz.open(pdf_path)
     
-    # --- 🔥 GENERATE UP TO 5 IMAGES 🔥 ---
-    pages_to_check = min(5, len(doc)) # Max 5 pages
+    # 1. GENERATE 5 IMAGES (DPI 72 for Speed & Size)
+    pages_to_check = min(5, len(doc))
     img_paths = []
-    log(f"📸 Generating images for first {pages_to_check} pages...")
     for i in range(pages_to_check):
-        pix = doc[i].get_pixmap(dpi=100) # Keep DPI low to stay within Groq size limits
+        pix = doc[i].get_pixmap(dpi=72)
         p_path = os.path.join(UPLOAD_FOLDER, f"analyze_page_{i}.jpg")
         pix.save(p_path)
         img_paths.append(p_path)
 
-    # Get Strategy (using multiple images)
+    # 2. GET AI STRATEGY
     ai_data = get_ai_config(img_paths)
     
-    # Default Config
     config = {
         "top_margin": 50, "bottom_margin": 50, "left_margin": 0,
         "is_two_column": False, "regex_pattern": "", "ignore_words": []
@@ -208,20 +201,23 @@ def process_cbt_logic(pdf_path):
     strategy_name = "FALLBACK_STD"
     if ai_data:
         config.update(ai_data)
-        strategy_name = "GROQ_MULTI_PAGE_DNA"
+        strategy_name = "GROQ_MULTI_PAGE"
 
-    # Extract
+    # 3. EXTRACT (Attempt 1)
     final_questions = extract_questions_with_strategy(doc, strategy_name, config)
 
-    if not final_questions:
-        log("⚠️ No Qs found. Activating PANIC MODE.")
+    # 4. SAFETY NET: If < 5 questions found (and doc has > 2 pages), assume margins killed it
+    if len(final_questions) < 5 and len(doc) > 2:
+        log("⚠️ Very few questions found. Margins might be too strict. Retrying with PANIC MODE (Zero Margins)...")
         config["top_margin"] = 0
         config["bottom_margin"] = 0
         config["left_margin"] = 0
-        final_questions = extract_questions_with_strategy(doc, "PANIC_MODE", config)
+        final_questions = extract_questions_with_strategy(doc, "PANIC_MODE_RETRY", config)
 
     if not final_questions:
-        raise Exception("Failed to crop ANY questions.")
+        raise Exception("Failed to crop ANY questions from the entire PDF.")
+
+    log(f"✅ Total Questions Found: {len(final_questions)}")
 
     data_json = {
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
@@ -306,7 +302,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark V18 (5-Page DNA Scan) 🚀"
+    return "Stark V19 (Full PDF Safety Lock) 🚀"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
@@ -316,7 +312,7 @@ def upload_file():
     if not is_authorized(request):
         return jsonify({"error": "Unauthorized"}), 403
 
-    log("🔵 New Request (Multi-Page AI)")
+    log("🔵 New Request (5-Page Analysis -> Full Crop)")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['pdf']
     
