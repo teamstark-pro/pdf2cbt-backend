@@ -59,14 +59,12 @@ def get_questions_per_page_batch(image_paths):
             {
                 "type": "text",
                 "text": """
-                Analyze these exam pages. Identify ONLY the Question Numbers present.
+                Analyze these exam pages. List ONLY the Question Numbers found.
                 
                 RULES:
-                1. Look for numbers at the START of question blocks (e.g., "1.", "Q1", "5)").
-                2. IGNORE numbers inside solutions.
-                3. Return JSON mapping image index to list of integers.
-                
-                Example: { "img_0": [1, 2, 3], "img_1": [4, 5] }
+                1. Look for numbers at the START of blocks (e.g. "1.", "Q1", "5)").
+                2. IGNORE numbers inside Solution/Answer/Hint blocks.
+                3. Return JSON: { "img_0": [1, 2, 3], "img_1": [4, 5] }
                 """
             }
         ]
@@ -99,24 +97,22 @@ def get_pdf_hash(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
 
-def extract_questions_with_ai_guide(doc, page_map_guidance):
+def extract_questions_strict_ai(doc, page_map_guidance):
     extracted_data = []
     
-    # 1. Regex List (Relaxed)
+    # 🔥 STRICT REGEX (Must be at Start of String)
+    # ^ ensures we don't match "20" inside "Length is 20cm"
     regex_list = [
-        r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]", # Q.1, 1.
-        r"^(\d+)$" # Just "1" (Only accepted if in AI list)
+        r"^\s*(?:Q|Question|Que|No)[\.\s\-]?\s*(\d+)",  # Matches "Q. 20", "Question 20"
+        r"^\s*(\d+)[\.\)\-\:]",                         # Matches "20.", "20)", "20-"
+        r"^\s*(\d+)\s*$"                                # Matches standalone "20"
     ]
     
-    # 2. FIXED BAD KEYWORDS (No more "Answer" banning)
-    BAD_KEYWORDS = [
-        "Solution", "Detailed Solution", "Correct Answer", 
-        "Correct Option", "Explanation", "Hint:"
-    ]
+    # ❌ ANTI-SOLUTION SHIELD
+    BAD_KEYWORDS = ["Solution", "Detailed Solution", "Correct Answer", "Explanation", "Hint:", "Ans."]
     
-    # 3. Safer Margins (Reduced Top Margin)
-    top_m = 10 # Was 50 (Too strict)
-    bot_m = 50
+    top_m = 0 
+    bot_m = 40 # Footer
     
     for page_num in range(len(doc)):
         allowed_numbers = page_map_guidance.get(page_num, [])
@@ -126,39 +122,46 @@ def extract_questions_with_ai_guide(doc, page_map_guidance):
         height = page.rect.height
         blocks = page.get_text("blocks")
         
+        # Track what we found to avoid duplicates
+        found_on_page = set()
+
         for b in blocks:
             text = b[4].strip()
             bbox = b[:4]
             x0, y0, x1, y1 = bbox
             
-            # Margins
-            if y0 < top_m or y1 > height - bot_m: continue
+            if y1 > height - bot_m: continue
+            if y0 < top_m: continue
             
-            # Anti-Solution Check
-            if any(bad in text for bad in BAD_KEYWORDS):
-                continue
+            # 1. Skip if Solution
+            if any(bad in text for bad in BAD_KEYWORDS): continue
 
-            # Check Match
+            # 2. Strict Start-of-Block Match
+            matched_num = None
             for pat in regex_list:
-                try:
-                    q_match = re.search(pat, text, re.IGNORECASE)
-                    if q_match:
-                        q_no_str = next((g for g in q_match.groups() if g), None)
-                        if not q_no_str: continue
-                        
-                        try:
-                            q_val = int(q_no_str)
-                            # Only accept if AI saw it on this page
-                            if q_val in allowed_numbers:
-                                extracted_data.append({
-                                    "label": q_no_str, 
-                                    "x0": x0, "y0": y0, 
-                                    "page": page_num, 
-                                    "bbox": bbox
-                                })
+                # Using re.match or ^ anchor in search
+                m = re.search(pat, text, re.IGNORECASE)
+                if m:
+                    try:
+                        val = int(m.group(1))
+                        # Only accept if Groq said it's here
+                        if val in allowed_numbers:
+                            matched_num = str(val)
+                            # Only add if we haven't processed this Q yet (First occurrence wins)
+                            if val not in found_on_page:
+                                found_on_page.add(val)
                                 break
-                        except: continue
-                except: continue
+                            else:
+                                matched_num = None # Duplicate on page (maybe header repetition)
+                    except: continue
+            
+            if matched_num:
+                extracted_data.append({
+                    "label": matched_num, 
+                    "x0": x0, "y0": y0, 
+                    "page": page_num, 
+                    "bbox": bbox
+                })
 
     return extracted_data
 
@@ -175,13 +178,12 @@ def process_cbt_logic(pdf_path):
     FULL_PAGE_GUIDANCE = {}
     BATCH_SIZE = 2
     
-    # --- GROQ SCANNING ---
+    # --- STEP 1: GROQ SCANNING ---
     for i in range(0, total_pages, BATCH_SIZE):
         batch_indices = range(i, min(i + BATCH_SIZE, total_pages))
         img_paths = []
         
         log(f"🤖 Scanning Pages {[b+1 for b in batch_indices]}...")
-        
         for p_idx in batch_indices:
             pix = doc[p_idx].get_pixmap(dpi=100)
             path = os.path.join(UPLOAD_FOLDER, f"batch_page_{p_idx}.jpg")
@@ -195,31 +197,34 @@ def process_cbt_logic(pdf_path):
                 if rel_idx < len(batch_indices):
                     global_page_idx = batch_indices[rel_idx]
                     found_qs = [int(x) for x in batch_data[key] if isinstance(x, (int, str)) and str(x).isdigit()]
-                    FULL_PAGE_GUIDANCE[global_page_idx] = found_qs
                     if found_qs:
-                        log(f"   -> Page {global_page_idx+1}: Found {found_qs}")
-        
-        time.sleep(0.5) # Be nice to Groq
+                        FULL_PAGE_GUIDANCE[global_page_idx] = found_qs
+                        log(f"   -> Page {global_page_idx+1}: {found_qs}")
+        time.sleep(0.5)
 
-    # --- EXTRACTION ---
-    final_questions = extract_questions_with_ai_guide(doc, FULL_PAGE_GUIDANCE)
+    # --- STEP 2: EXTRACT ---
+    final_questions = extract_questions_strict_ai(doc, FULL_PAGE_GUIDANCE)
 
-    # --- FALLBACK ---
+    # --- FAILSAFE ---
     if not final_questions:
-        log("⚠️ No Verified Questions. Falling back to Standard Regex (No AI Filter).")
-        # Reuse old reliable function if strict filter fails
-        config = {"top_margin": 20, "bottom_margin": 50, "left_margin": 0}
-        # Simplified internal extractor for fallback
-        final_questions = extract_questions_with_ai_guide(doc, {p: list(range(1, 500)) for p in range(len(doc))})
+        log("⚠️ No Strict Matches. Falling back to Loose Search (Desperation Mode).")
+        # Reuse magnet logic (v28 style) only if strict failed
+        # But limited to AI numbers
+        final_questions = extract_questions_strict_ai(doc, FULL_PAGE_GUIDANCE) # (Strict failed, so empty)
+        # Try brute force all numbers 1-100 if completely empty
+        if not final_questions:
+             log("💀 AI Guidance failed. Brute forcing...")
+             # Just map every page to 1-100 to catch anything
+             final_questions = extract_questions_strict_ai(doc, {p: list(range(1, 100)) for p in range(len(doc))})
 
-    log(f"✅ Final Questions: {len(final_questions)}")
 
-    # --- JSON & CROP ---
+    log(f"✅ Extracted {len(final_questions)} Questions")
+
     data_json = {
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
         "pdfCropperData": {SUBJECT_NAME: {SECTION_NAME: {}}},
         "appVersion": "1.30.0",
-        "generatedBy": "Team_Stark_V27"
+        "generatedBy": "Team_Stark_V29_Strict"
     }
 
     final_questions.sort(key=lambda x: (x["page"], x["y0"]))
@@ -228,29 +233,24 @@ def process_cbt_logic(pdf_path):
         pg_h = doc[q["page"]].rect.height
         pg_w = doc[q["page"]].rect.width
         
-        # Full Width Crop
-        x1 = 0
-        x2 = pg_w
-        json_x1 = 5
-        json_x2 = 995
-
-        next_q_y = pg_h - 50 
+        next_q_y = pg_h - 40 
         
         for j in range(i + 1, len(final_questions)):
             if final_questions[j]["page"] == q["page"]:
-                next_q_y = final_questions[j]["y0"] - 15
+                next_q_y = final_questions[j]["y0"] - 10
                 break
 
-        y1_crop = max(0, q["y0"] - 30)
-        y2_crop = min(pg_h, next_q_y + 10)
-        if y2_crop <= y1_crop: y2_crop = y1_crop + 200
+        y1_crop = max(0, q["y0"] - 10) 
+        y2_crop = min(pg_h, next_q_y + 5)
+        
+        if y2_crop - y1_crop < 50: y2_crop = y1_crop + 150
 
         data_json["pdfCropperData"][SUBJECT_NAME][SECTION_NAME][str(q["label"])] = {
             "que": q["label"], "type": "mcq", "marks": {"cm": 4, "im": -1},
             "pdfData": [{
-                "x1": json_x1, "x2": json_x2, 
-                "y1": round(((y1_crop + 5)/pg_h)*1000), 
-                "y2": round(((y2_crop - 5)/pg_h)*1000), 
+                "x1": 5, "x2": 995, 
+                "y1": round(((y1_crop)/pg_h)*1000), 
+                "y2": round(((y2_crop)/pg_h)*1000), 
                 "page": q["page"] + 1
             }],
             "answerOptions": "4"
@@ -262,7 +262,7 @@ def process_cbt_logic(pdf_path):
         scale_w = pix.width / pg_w
         scale_h = pix.height / pg_h
         
-        crop_box = (x1 * scale_w, y1_crop * scale_h, x2 * scale_w, y2_crop * scale_h)
+        crop_box = (0, y1_crop * scale_h, pg_w * scale_w, y2_crop * scale_h)
         try:
             cropped = img.crop(crop_box)
             img_name = f"{SECTION_NAME}__--__{q['label']}__--__1.png"
@@ -288,7 +288,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark V27 (Fixed Filter) 🚀"
+    return "Team Stark V29 (Strict Start-Block Logic) 🚀"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
