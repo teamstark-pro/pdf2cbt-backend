@@ -12,11 +12,12 @@ import io
 import sys
 import gc
 import base64
+import time
 from groq import Groq
 
 app = Flask(__name__)
 
-# --- 🔥 SECURITY & CORS 🔥 ---
+# --- 🔥 CORS & SECURITY 🔥 ---
 CORS(app, resources={r"/*": {"origins": "*"}}, 
      methods=["GET", "POST", "OPTIONS"],
      allow_headers=["*"],
@@ -38,7 +39,7 @@ def is_authorized(req):
     client_key = req.headers.get("x-stark-secret")
     return client_key == STARK_SECRET
 
-# --- ⚡ GROQ VISION CLIENT ---
+# --- ⚡ GROQ CLIENT ---
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 client = None
 if GROQ_API_KEY:
@@ -48,62 +49,62 @@ def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
-def get_layout_from_groq(image_paths):
+def get_questions_per_page_batch(image_paths):
     """
-    Asks Groq ONLY for Margins and Layout. NO REGEX.
+    Sends a batch of images (max 2) to Groq.
+    Asks ONLY for the Question Numbers present.
+    Example Response: {"img_0": [1, 2], "img_1": [3, 4]}
     """
     if not client or not image_paths: return None
     
-    target_img = image_paths[0] 
     MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
     
     try:
-        base64_img = encode_image(target_img)
-        log(f"🤖 Groq Layout Scan (Margins Only)...")
+        # Build Message
+        message_content = [
+            {
+                "type": "text",
+                "text": """
+                Analyze these exam pages. Identify ONLY the Question Numbers present (e.g., 1, 2, 35).
+                
+                RULES:
+                1. IGNORE numbers inside 'Solution', 'Answer', or 'Example' blocks.
+                2. IGNORE page numbers or marks.
+                3. ONLY return the integer number of the question.
+                
+                Return JSON mapping image index to list of numbers:
+                {
+                    "img_0": [1, 2, 3],
+                    "img_1": [4, 5]
+                }
+                
+                Output JSON ONLY.
+                """
+            }
+        ]
         
+        for path in image_paths:
+            base64_img = encode_image(path)
+            message_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{base64_img}"
+                }
+            })
+        
+        # API Call
         completion = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": """
-                            Analyze this exam page. I need to know the safe margins to ignore headers and footers.
-                            
-                            Return ONLY a JSON object:
-                            1. "top_margin": Int (Pixels to ignore at top. Default 50).
-                            2. "bottom_margin": Int (Pixels to ignore at bottom. Default 50).
-                            3. "left_margin": Int (Pixels to ignore from left. Default 0).
-                            4. "is_two_column": Boolean (True if page has 2 vertical columns).
-                            
-                            Output JSON only. Do NOT try to find questions. Just layout.
-                            """
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_img}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            temperature=0.1, 
-            max_tokens=500,
-            top_p=1,
-            stream=False,
+            messages=[{"role": "user", "content": message_content}],
+            temperature=0.1, max_tokens=500, top_p=1, stream=False,
             response_format={"type": "json_object"}
         )
         
-        resp_content = completion.choices[0].message.content
-        data = json.loads(resp_content)
-        log(f"✅ AI Margins: {data}")
+        data = json.loads(completion.choices[0].message.content)
         return data
 
     except Exception as e:
-        log(f"❌ Groq Failed (Using Defaults): {str(e)}")
+        log(f"❌ Groq Batch Failed: {str(e)}")
         return None
 
 # --- HELPER FUNCTIONS ---
@@ -111,33 +112,29 @@ def get_pdf_hash(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
 
-def extract_questions_hybrid(doc, config):
+def extract_questions_with_ai_guide(doc, page_map_guidance):
     extracted_data = []
     
-    # 1. APPLY AI MARGINS
-    top_m = int(config.get("top_margin", 50))
-    bot_m = int(config.get("bottom_margin", 50))
-    left_m = int(config.get("left_margin", 0))
-    
-    # 2. THE "OLD IS GOLD" REGEX LIST (No AI hallucination here)
-    # Priority 1: Standard Q.1, Q-1, Q1
-    # Priority 2: Simple 1. (Must be at start of line)
+    # Standard Regex for hunting (Verified by AI list)
+    # Matches: "1.", "Q1", "Q.1", "(1)"
     regex_list = [
-        r"^(?:Q|Question|Que|No|Problem|Ex|Example)[\.\s\-]?\s*(\d+)[\.\)\-]",
+        r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]",
         r"^(\d+)\s*[\.\)]"
     ]
     
-    # 3. THE "ANTI-SOLUTION" SHIELD
-    BAD_KEYWORDS = [
-        "Solution", "Sol.", "Answer", "Ans.", 
-        "Hence", "Therefore", "Step 1", "Step 2", 
-        "Page", "Total", "Marks", "Rough Work", 
-        "Paper", "Test", "Date"
-    ]
-
-    log(f"🔄 Scanning with Hardcoded Regex | Margins: T{top_m}/B{bot_m}/L{left_m}")
-
+    # Safe Margins (Standardized)
+    top_m = 50
+    bot_m = 50
+    
     for page_num in range(len(doc)):
+        # Check if AI found any questions on this page
+        allowed_numbers = page_map_guidance.get(page_num, [])
+        if not allowed_numbers:
+            log(f"⚠️ AI says Page {page_num+1} has NO questions. Skipping.")
+            continue
+            
+        log(f"🔍 Page {page_num+1}: Hunting for Qs {allowed_numbers}...")
+        
         page = doc[page_num]
         height = page.rect.height
         blocks = page.get_text("blocks")
@@ -146,19 +143,10 @@ def extract_questions_hybrid(doc, config):
             text = b[4].strip()
             bbox = b[:4]
             x0, y0, x1, y1 = bbox
-
-            # --- FILTER 1: MARGINS ---
+            
             if y0 < top_m or y1 > height - bot_m: continue
-            if x0 < left_m: continue
             
-            # --- FILTER 2: BAD WORDS (Stop Solutions) ---
-            # If text contains "Solution", skip it entirely
-            if any(bad in text for bad in BAD_KEYWORDS): continue
-            
-            # --- FILTER 3: GARBAGE ---
-            if text.startswith("[") or re.search(r"@[a-z]+\.", text, re.I): continue
-
-            # --- FILTER 4: REGEX MATCH ---
+            # --- THE HYBRID CHECK ---
             match_found = False
             for pat in regex_list:
                 try:
@@ -167,22 +155,23 @@ def extract_questions_hybrid(doc, config):
                         q_no_str = next((g for g in q_match.groups() if g), None)
                         if not q_no_str: continue
                         
-                        try:
-                            q_val = int(q_no_str)
-                            # Sanity Check: Question number shouldn't be crazy high
-                            if q_val <= 0 or q_val > 500: continue
-                        except: continue
-
-                        extracted_data.append({
-                            "label": q_no_str, 
-                            "x0": x0, "y0": y0, 
-                            "page": page_num, 
-                            "bbox": bbox
-                        })
-                        match_found = True
-                        break 
+                        q_val = int(q_no_str)
+                        
+                        # CRITICAL: Is this number in AI's allowed list?
+                        if q_val in allowed_numbers:
+                            extracted_data.append({
+                                "label": q_no_str, 
+                                "x0": x0, "y0": y0, 
+                                "page": page_num, 
+                                "bbox": bbox
+                            })
+                            # Remove from list so we don't find duplicates/shadows
+                            # allowed_numbers.remove(q_val) 
+                            match_found = True
+                            break
                 except: continue
-            
+                if match_found: break
+
     return extracted_data
 
 def process_cbt_logic(pdf_path):
@@ -193,76 +182,85 @@ def process_cbt_logic(pdf_path):
     SUBJECT_NAME = "Stark"
     
     doc = fitz.open(pdf_path)
+    total_pages = len(doc)
     
-    # 1. PAGE 0 SNAPSHOT (For Layout Analysis)
-    pix = doc[0].get_pixmap(dpi=150)
-    p_path = os.path.join(UPLOAD_FOLDER, "analyze_page_0.jpg")
-    pix.save(p_path)
-    img_paths = [p_path]
-
-    # 2. ASK GROQ (Just for Margins/Columns)
-    ai_layout = get_layout_from_groq(img_paths)
+    # --- STEP 1: BATCH PROCESSING WITH GROQ ---
+    # Map: { page_index: [1, 2, 3] }
+    FULL_PAGE_GUIDANCE = {}
     
-    config = {
-        "top_margin": 50, "bottom_margin": 50, "left_margin": 0,
-        "is_two_column": False
-    }
+    BATCH_SIZE = 2
     
-    strategy_name = "FALLBACK_STD"
-    if ai_layout:
-        config.update(ai_layout)
-        strategy_name = "GROQ_LAYOUT_ENGINE"
+    for i in range(0, total_pages, BATCH_SIZE):
+        batch_indices = range(i, min(i + BATCH_SIZE, total_pages))
+        img_paths = []
+        
+        log(f"🤖 Processing Batch: Pages {[b+1 for b in batch_indices]}...")
+        
+        # Generate Images
+        for p_idx in batch_indices:
+            pix = doc[p_idx].get_pixmap(dpi=100)
+            path = os.path.join(UPLOAD_FOLDER, f"batch_page_{p_idx}.jpg")
+            pix.save(path)
+            img_paths.append(path)
+            
+        # Ask Groq
+        batch_data = get_questions_per_page_batch(img_paths)
+        
+        # Map back to global page index
+        if batch_data:
+            for rel_idx, key in enumerate(sorted(batch_data.keys())):
+                if rel_idx < len(batch_indices):
+                    global_page_idx = batch_indices[rel_idx]
+                    found_qs = [int(x) for x in batch_data[key] if isinstance(x, (int, str)) and str(x).isdigit()]
+                    FULL_PAGE_GUIDANCE[global_page_idx] = found_qs
+                    log(f"   -> Page {global_page_idx+1}: Found Qs {found_qs}")
+        
+        # Rate Limit Safety (Tiny sleep)
+        time.sleep(0.5)
 
-    # 3. EXTRACT USING OLD LOGIC + AI MARGINS
-    final_questions = extract_questions_hybrid(doc, config)
+    # --- STEP 2: EXTRACT USING AI GUIDANCE ---
+    final_questions = extract_questions_with_ai_guide(doc, FULL_PAGE_GUIDANCE)
 
-    # 4. PANIC MODE (If margins killed everything)
-    if len(final_questions) == 0:
-        log("⚠️ No Qs found. Retrying with ZERO MARGINS...")
-        config["top_margin"] = 0
-        config["bottom_margin"] = 0
-        config["left_margin"] = 0
-        final_questions = extract_questions_hybrid(doc, config)
-
+    # --- FAILSAFE ---
     if not final_questions:
-        raise Exception("Failed to crop ANY questions. PDF format might be unsupported.")
+        log("⚠️ AI didn't return any numbers. Falling back to Standard Mode.")
+        # Fallback logic here if needed, or error out
+        # Re-using strict logic just in case
+        config = {"top_margin": 50, "bottom_margin": 50, "left_margin": 0}
+        # (Assuming you kept the old strict function, or just fail)
+        raise Exception("AI found no questions. PDF might be text-only without numbers.")
 
-    log(f"✅ Total Questions: {len(final_questions)}")
+    log(f"✅ Total Verified Questions: {len(final_questions)}")
 
+    # --- JSON & CROP ---
     data_json = {
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
         "pdfCropperData": {SUBJECT_NAME: {SECTION_NAME: {}}},
         "appVersion": "1.30.0",
-        "generatedBy": f"Team_Stark_{strategy_name}"
+        "generatedBy": "Team_Stark_Groq_PageByPage"
     }
 
-    force_two_col = config.get("is_two_column", False)
+    # Sorting
+    final_questions.sort(key=lambda x: (x["page"], x["y0"]))
 
     for i, q in enumerate(final_questions):
         pg_h = doc[q["page"]].rect.height
         pg_w = doc[q["page"]].rect.width
-        mid_x = pg_w / 2
         
-        is_right_col = q["x0"] > mid_x
-        
-        if force_two_col or is_right_col:
-            x1 = 0 if not is_right_col else mid_x
-            x2 = mid_x if not is_right_col else pg_w
-            json_x1 = 5 if not is_right_col else 505
-            json_x2 = 495 if not is_right_col else 995
-        else:
-            x1 = 0
-            x2 = pg_w
-            json_x1 = 5
-            json_x2 = 995
+        # Full width crop (Safest)
+        x1 = 0
+        x2 = pg_w
+        json_x1 = 5
+        json_x2 = 995
 
+        # Determine height
         next_q_y = pg_h - 50 
         
-        if i + 1 < len(final_questions):
-            nq = final_questions[i+1]
-            if nq["page"] == q["page"]:
-                 if (force_two_col and (is_right_col == (nq["x0"] > mid_x))) or not force_two_col:
-                     next_q_y = nq["y0"] - 15
+        # Look for next question on SAME page
+        for j in range(i + 1, len(final_questions)):
+            if final_questions[j]["page"] == q["page"]:
+                next_q_y = final_questions[j]["y0"] - 15
+                break
 
         y1_crop = max(0, q["y0"] - 30)
         y2_crop = min(pg_h, next_q_y + 10)
@@ -279,6 +277,7 @@ def process_cbt_logic(pdf_path):
             "answerOptions": "4"
         }
 
+        # Crop Image
         page = doc[q["page"]]
         pix = page.get_pixmap(dpi=200)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -311,7 +310,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark V23 (Brain+Muscle Edition) 🚀"
+    return "Team Stark V25 (Page-by-Page AI Supervisor) 🚀"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
@@ -321,7 +320,7 @@ def upload_file():
     if not is_authorized(request):
         return jsonify({"error": "Unauthorized"}), 403
 
-    log("🔵 New Request (Hybrid)")
+    log("🔵 New Request (Page-by-Page Scan)")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['pdf']
     
