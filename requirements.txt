@@ -2,3 +2,4 @@ flask
 flask-cors
 pymupdf
 Pillow
+google-generativeai
