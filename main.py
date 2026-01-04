@@ -30,34 +30,41 @@ if GENAI_API_KEY:
 else:
     log("⚠️ WARNING: GEMINI_API_KEY missing!")
 
-# --- 🧠 AI ANALYSIS ---
+# --- 🧠 AI ANALYSIS (Auto-Switch Model) ---
 def get_ai_config(image_paths):
     if not GENAI_API_KEY: return None
-    try:
-        log("🤖 Asking Gemini for Regex & Margins...")
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        content_parts = []
-        for path in image_paths:
-            content_parts.append(genai.upload_file(path))
-        
-        prompt = """
-        Analyze these exam pages. Return ONLY a JSON object.
-        1. "top_margin": Header height in pixels (e.g. 60).
-        2. "bottom_margin": Footer height in pixels (e.g. 50).
-        3. "regex_pattern": Python Regex to find Question Numbers at start of line.
-           - Matches: "Q.1", "1.", "(1)", "Q1", "1 )"
-           - STRICTLY NO equations or options.
-        """
-        content_parts.append(prompt)
-        
-        result = model.generate_content(content_parts)
-        text_resp = result.text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(text_resp)
-        log(f"✅ AI Suggested: {data}")
-        return data
-    except Exception as e:
-        log(f"❌ AI Failed: {e}")
-        return None
+    
+    # Try Flash first, then Pro
+    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro']
+    
+    for model_name in models_to_try:
+        try:
+            log(f"🤖 Trying AI Model: {model_name}...")
+            model = genai.GenerativeModel(model_name)
+            content_parts = []
+            for path in image_paths:
+                content_parts.append(genai.upload_file(path))
+            
+            prompt = """
+            Analyze these exam pages. Return ONLY a JSON object.
+            1. "top_margin": Header height in pixels (e.g. 60).
+            2. "bottom_margin": Footer height in pixels (e.g. 50).
+            3. "regex_pattern": Python Regex to find Question Numbers at start of line.
+               - Matches: "Q.1", "1.", "(1)", "Q1", "1 )"
+               - STRICTLY NO equations or options.
+            """
+            content_parts.append(prompt)
+            
+            result = model.generate_content(content_parts)
+            text_resp = result.text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(text_resp)
+            log(f"✅ AI Success ({model_name}): {data}")
+            return data
+        except Exception as e:
+            log(f"❌ {model_name} Failed: {e}")
+            continue # Try next model
+            
+    return None
 
 # --- HELPER FUNCTIONS ---
 def get_pdf_hash(path):
@@ -65,12 +72,8 @@ def get_pdf_hash(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 def extract_questions_with_strategy(doc, strategy_name, top_m, bot_m, regex_pattern):
-    """
-    Tries to extract questions using a specific strategy (Margins + Regex).
-    Returns a list of questions found.
-    """
     extracted_data = []
-    log(f"🔄 Trying Strategy: {strategy_name} | Regex: {regex_pattern}")
+    log(f"🔄 Strategy: {strategy_name} | Regex: {regex_pattern} | Margins: {top_m}/{bot_m}")
 
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -140,7 +143,7 @@ def process_cbt_logic(pdf_path):
         pix.save(p_path)
         img_paths.append(p_path)
 
-    # 2. DEFINE STRATEGIES (The Self-Healing Logic)
+    # 2. DEFINE STRATEGIES (Hierarchy of Logic)
     strategies = []
     
     # Strategy A: AI (Priority 1)
@@ -153,18 +156,26 @@ def process_cbt_logic(pdf_path):
             "regex": ai_data.get("regex_pattern")
         })
 
-    # Strategy B: Universal Fallback 1 (Standard Q.1)
+    # Strategy B: Standard Fallback (Q.1, 1.)
     strategies.append({
         "name": "FALLBACK_STANDARD",
-        "top": 60, "bot": 50,
+        "top": 50, "bot": 50,
         "regex": r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]"
     })
     
-    # Strategy C: Aggressive Fallback (Loose matching for '1 .')
+    # Strategy C: Loose Fallback (1)
     strategies.append({
-        "name": "FALLBACK_AGGRESSIVE",
+        "name": "FALLBACK_LOOSE",
         "top": 50, "bot": 50,
         "regex": r"^(\d+)\s*[\.\)]"
+    })
+
+    # Strategy D: PANIC MODE (Brute Force - No margins, just numbers)
+    # Ye tab chalega jab sab fail ho jayein.
+    strategies.append({
+        "name": "PANIC_MODE_BRUTE_FORCE",
+        "top": 0, "bot": 0, # Scan Full Page
+        "regex": r"^(\d+)"
     })
 
     # 3. EXECUTE STRATEGIES
@@ -174,16 +185,17 @@ def process_cbt_logic(pdf_path):
     for strat in strategies:
         questions = extract_questions_with_strategy(doc, strat["name"], strat["top"], strat["bot"], strat["regex"])
         
-        if len(questions) > 0:
-            log(f"✅ Success! Found {len(questions)} questions using {strat['name']}")
+        # Check if we found a reasonable amount of questions (at least 2)
+        if len(questions) >= 2:
+            log(f"✅ LOCKED! Found {len(questions)} questions using {strat['name']}")
             final_questions = questions
             used_strategy = strat["name"]
-            break # Stop trying other strategies if one works
+            break 
         else:
-            log(f"⚠️ {strat['name']} found 0 questions. Trying next...")
+            log(f"⚠️ {strat['name']} found {len(questions)} (too few). Trying next...")
 
     if not final_questions:
-        raise Exception("Failed to crop ANY questions. Is this a Scanned PDF (Image-only)?")
+        raise Exception("Failed to crop ANY questions. PDF might be scanned images (OCR required).")
 
     # 4. BUILD JSON & CROP IMAGES
     data_json = {
@@ -193,34 +205,31 @@ def process_cbt_logic(pdf_path):
         "generatedBy": f"Team_Stark_{used_strategy}"
     }
 
-    # Process discovered questions...
     for i, q in enumerate(final_questions):
-        # Column Check
         page_width = doc[q["page"]].rect.width
         mid_x = page_width / 2
         is_right_col = q["x0"] > mid_x
         
-        # Calculate Height
-        # Simple Logic: Height is distance to next question OR arbitrary limit
-        # Finding next question on same page/column
-        next_q_y = doc[q["page"]].rect.height - 50 # Default to footer
-        
-        # Find strictly next question in list
-        if i + 1 < len(final_questions):
-            nq = final_questions[i+1]
-            if nq["page"] == q["page"]:
-                # Check column consistency
-                nq_is_right = nq["x0"] > mid_x
-                if is_right_col == nq_is_right:
-                    next_q_y = nq["y0"] - 15
-
-        height = next_q_y - q["y0"]
-        if height < 20: height = 100 # Safety buffer
-
-        # JSON Coords
+        # Smart Height Calculation
         pg_h = doc[q["page"]].rect.height
         pg_w = doc[q["page"]].rect.width
         
+        # Default next Y is footer
+        next_q_y = pg_h - 50 
+        
+        # Look ahead for next question
+        if i + 1 < len(final_questions):
+            nq = final_questions[i+1]
+            if nq["page"] == q["page"]:
+                 # Check column consistency
+                 nq_is_right = nq["x0"] > mid_x
+                 if is_right_col == nq_is_right:
+                     next_q_y = nq["y0"] - 15
+
+        height = next_q_y - q["y0"]
+        if height < 20: height = 150 # Safety buffer if calc fails
+
+        # JSON Coords
         data_json["pdfCropperData"][SUBJECT_NAME][SECTION_NAME][str(q["label"])] = {
             "que": q["label"], "type": "mcq", "marks": {"cm": 4, "im": -1},
             "pdfData": [{
@@ -271,10 +280,11 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark Auto-Healing Backend V7 🚀"
+    return "Team Stark Panic-Mode Backend V8 🚀"
 
 @app.route('/process', methods=['POST'])
 def upload_file():
+    log("🔵 New Request Received")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['pdf']
     if file.filename == '': return jsonify({"error": "No selected file"}), 400
