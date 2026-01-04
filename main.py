@@ -10,15 +10,14 @@ from PIL import Image
 import zipfile
 import io
 import sys
-import gc  # Garbage Collector for RAM
+import gc
+import random
 import google.generativeai as genai
 
 app = Flask(__name__)
 
-# --- 🔥 CORS FIX FOR TABLETS/MOBILE 🔥 ---
-# "origins": "*" -> Sabko allow karo
-# "allow_headers": "*" -> Saare headers allow karo
-# "expose_headers" -> Filename read karne ke liye zaroori hai
+# --- 🔥 SECURITY & CORS 🔥 ---
+# Allow Frontend to send custom header 'x-stark-secret'
 CORS(app, resources={r"/*": {"origins": "*"}}, 
      methods=["GET", "POST", "OPTIONS"],
      allow_headers=["*"],
@@ -32,44 +31,71 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 def log(msg):
     print(f"[STARK LOG] {msg}", file=sys.stdout, flush=True)
 
-# --- 🔑 CONFIG & DIAGNOSTICS ---
-GENAI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if GENAI_API_KEY:
-    genai.configure(api_key=GENAI_API_KEY)
+# --- 🔐 SECURITY CHECK ---
+STARK_SECRET = os.environ.get("STARK_SECRET_KEY", "open_access_mode")
 
-# --- 🧠 AI ANALYSIS ---
-def get_ai_config(image_paths):
-    if not GENAI_API_KEY: return None
+def is_authorized(req):
+    # If secret is not set in env, allow everyone (Debug mode)
+    if STARK_SECRET == "open_access_mode": return True
     
-    # Updated Model List
-    models_to_try = [
-        'gemini-2.0-flash', 
-        'gemini-2.5-flash', 
-        'gemini-flash-latest',
-        'gemini-1.5-flash'
-    ]
+    # Check Header
+    client_key = req.headers.get("x-stark-secret")
+    if client_key == STARK_SECRET:
+        return True
+    return False
+
+# --- 🔑 KEY ROTATION ---
+RAW_KEYS = os.environ.get("GEMINI_API_KEYS", "")
+API_KEY_POOL = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
+
+def configure_random_key():
+    if not API_KEY_POOL:
+        # Fallback to single key if pool is empty
+        single_key = os.environ.get("GEMINI_API_KEY")
+        if single_key:
+            genai.configure(api_key=single_key)
+            return True
+        return False
+    
+    selected_key = random.choice(API_KEY_POOL)
+    genai.configure(api_key=selected_key)
+    log(f"🔑 Rotated Key ending in ...{selected_key[-4:]}")
+    return True
+
+# --- 🧠 SUPER AI ANALYSIS ---
+def get_ai_config(image_paths):
+    if not configure_random_key(): return None
+    
+    models_to_try = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-flash-latest']
     
     for model_name in models_to_try:
         try:
-            log(f"🤖 Attempting AI Model: {model_name}...")
+            log(f"🤖 Analyzing with {model_name}...")
             model = genai.GenerativeModel(model_name)
             content_parts = []
             for path in image_paths:
                 content_parts.append(genai.upload_file(path))
             
+            # --- THE GOD MODE PROMPT ---
             prompt = """
-            Analyze these exam pages. Return ONLY JSON.
-            1. "top_margin": Header height px (e.g. 60).
-            2. "bottom_margin": Footer height px (e.g. 50).
-            3. "regex_pattern": Regex for Question Start. 
-               Ex: "^Q\\.?[\\s-]?\\s?(\\d+)[\\.\\)]"
+            Analyze these exam pages deeply. I need to crop individual questions.
+            Return ONLY a JSON object with these fields:
+            
+            1. "top_margin": Header height in pixels to safely ignore (e.g., 60).
+            2. "bottom_margin": Footer height in pixels (e.g., 50).
+            3. "regex_pattern": Python Regex to match the Question Number at the start of a line.
+               - Examples: "^Q\\.?[\\s-]?\\s?(\\d+)[\\.\\)]" or "^(\\d+)\\s*[\\.]"
+            4. "is_two_column": Boolean (true/false). Does the layout look like 2 columns?
+            5. "min_question_number": Integer. The first question number visible (usually 1).
+            
+            Be precise. If the page is split vertically into two distinct columns of questions, set is_two_column to true.
             """
             content_parts.append(prompt)
             
             result = model.generate_content(content_parts)
             text_resp = result.text.replace("```json", "").replace("```", "").strip()
             data = json.loads(text_resp)
-            log(f"✅ AI Success ({model_name}): {data}")
+            log(f"✅ AI Insight: {data}")
             return data
         except Exception as e:
             log(f"❌ {model_name} Error: {str(e)[:50]}...")
@@ -82,9 +108,16 @@ def get_pdf_hash(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
 
-def extract_questions_with_strategy(doc, strategy_name, top_m, bot_m, regex_pattern):
+def extract_questions_with_strategy(doc, strategy_name, config):
     extracted_data = []
-    log(f"🔄 Strategy: {strategy_name} | Regex: {regex_pattern} | Margins: {top_m}/{bot_m}")
+    
+    # Unpack Config
+    top_m = int(config.get("top_margin", 50))
+    bot_m = int(config.get("bottom_margin", 50))
+    regex = config.get("regex_pattern")
+    force_two_col = config.get("is_two_column", False)
+    
+    log(f"🔄 Executing {strategy_name} | Regex: {regex} | 2-Col: {force_two_col}")
 
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -101,13 +134,14 @@ def extract_questions_with_strategy(doc, strategy_name, top_m, bot_m, regex_patt
             if text.startswith("["): continue 
             if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", text, re.I): continue
 
-            # Loose X-Check
-            if "PANIC" not in strategy_name:
-                if x0 > 80 and x0 < mid_x: continue 
-                if x0 > mid_x + 80: continue
+            # If AI says it's definitely NOT 2 column, enforce strict full width check
+            # Otherwise, keep loose check
+            if not force_two_col and "PANIC" not in strategy_name:
+                 # If text is suspiciously in the middle, might be garbage
+                 pass 
 
             try:
-                q_match = re.search(regex_pattern, text, re.IGNORECASE)
+                q_match = re.search(regex, text, re.IGNORECASE)
                 if q_match:
                     if any(x in text for x in ["Answer", "Solution", "Page", "Total"]): continue
                     q_no_str = next((g for g in q_match.groups() if g), None)
@@ -137,47 +171,55 @@ def process_cbt_logic(pdf_path):
     
     doc = fitz.open(pdf_path)
     
-    # Images for AI (Low DPI to save RAM)
+    # Generate Images (Low DPI)
     pages_to_check = min(2, len(doc))
     img_paths = []
     for i in range(pages_to_check):
-        pix = doc[i].get_pixmap(dpi=100) # Reduced DPI for RAM safety
+        pix = doc[i].get_pixmap(dpi=100)
         p_path = os.path.join(UPLOAD_FOLDER, f"analyze_page_{i}.jpg")
         pix.save(p_path)
         img_paths.append(p_path)
 
-    # Strategies
+    # --- STRATEGY BUILDER ---
     strategies = []
+    
+    # 1. AI STRATEGY (High Precision)
     ai_data = get_ai_config(img_paths)
     if ai_data:
         strategies.append({
-            "name": "GEMINI_AI",
-            "top": int(ai_data.get("top_margin", 60)),
-            "bot": int(ai_data.get("bottom_margin", 50)),
-            "regex": ai_data.get("regex_pattern")
+            "name": "GEMINI_GOD_MODE",
+            "top_margin": ai_data.get("top_margin"),
+            "bottom_margin": ai_data.get("bottom_margin"),
+            "regex_pattern": ai_data.get("regex_pattern"),
+            "is_two_column": ai_data.get("is_two_column")
         })
 
+    # 2. FALLBACK STRATEGIES
     strategies.append({
-        "name": "FALLBACK_STANDARD",
-        "top": 50, "bot": 50,
-        "regex": r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]"
+        "name": "FALLBACK_STD",
+        "top_margin": 50, "bottom_margin": 50,
+        "regex_pattern": r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]",
+        "is_two_column": False # Assume single unless proven otherwise
     })
     
     strategies.append({
         "name": "PANIC_MODE",
-        "top": 0, "bot": 0,
-        "regex": r"^(\d+)"
+        "top_margin": 0, "bottom_margin": 0,
+        "regex_pattern": r"^(\d+)",
+        "is_two_column": False
     })
 
     final_questions = []
     used_strategy = "NONE"
-    
+    active_config = {}
+
     for strat in strategies:
-        questions = extract_questions_with_strategy(doc, strat["name"], strat["top"], strat["bot"], strat["regex"])
+        questions = extract_questions_with_strategy(doc, strat["name"], strat)
         if len(questions) >= 2:
-            log(f"✅ LOCKED! Found {len(questions)} questions using {strat['name']}")
+            log(f"✅ LOCKED! Found {len(questions)} qs using {strat['name']}")
             final_questions = questions
             used_strategy = strat["name"]
+            active_config = strat
             break 
 
     if not final_questions:
@@ -190,23 +232,28 @@ def process_cbt_logic(pdf_path):
         "generatedBy": f"Team_Stark_{used_strategy}"
     }
 
-    # Process and Crop
+    # --- CROP LOGIC WITH AI INTELLIGENCE ---
+    force_two_col = active_config.get("is_two_column", False)
+
     for i, q in enumerate(final_questions):
         pg_h = doc[q["page"]].rect.height
         pg_w = doc[q["page"]].rect.width
         mid_x = pg_w / 2
         
-        # Smart Column Detection
+        # 1. Determine Column Status
+        # If AI said "It's Two Column", we respect that.
+        # OR if the question is literally on the right side.
         is_right_col = q["x0"] > mid_x
-        page_qs = [xq for xq in final_questions if xq["page"] == q["page"]]
-        has_right_col = any(xq["x0"] > mid_x + 20 for xq in page_qs)
         
-        if has_right_col:
+        # Determine crop width
+        if force_two_col or is_right_col:
+            # Strictly split page in half
             x1 = 0 if not is_right_col else mid_x
             x2 = mid_x if not is_right_col else pg_w
             json_x1 = 5 if not is_right_col else 505
             json_x2 = 495 if not is_right_col else 995
         else:
+            # Single Column (Full Width)
             x1 = 0
             x2 = pg_w
             json_x1 = 5
@@ -217,7 +264,8 @@ def process_cbt_logic(pdf_path):
         if i + 1 < len(final_questions):
             nq = final_questions[i+1]
             if nq["page"] == q["page"]:
-                 if not has_right_col or (is_right_col == (nq["x0"] > mid_x)):
+                 # If in same column zone, crop till next question
+                 if (force_two_col and (is_right_col == (nq["x0"] > mid_x))) or not force_two_col:
                      next_q_y = nq["y0"] - 15
 
         y1_crop = max(0, q["y0"] - 30)
@@ -235,31 +283,23 @@ def process_cbt_logic(pdf_path):
             "answerOptions": "4"
         }
 
-        # Memory Efficient Crop
         page = doc[q["page"]]
-        pix = page.get_pixmap(dpi=200) # Lower DPI for output to save RAM
+        pix = page.get_pixmap(dpi=200)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        
         scale_w = pix.width / pg_w
         scale_h = pix.height / pg_h
         
         crop_box = (x1 * scale_w, y1_crop * scale_h, x2 * scale_w, y2_crop * scale_h)
-        
         try:
             cropped = img.crop(crop_box)
             img_name = f"{SECTION_NAME}__--__{q['label']}__--__1.png"
             cropped.save(os.path.join(EXPORT_DIR, img_name))
         except: pass
-        
-        # Free Memory
-        del img
-        del pix
+        del img, pix
 
-    # Explicit Garbage Collection
     doc.close()
     gc.collect()
 
-    # ZIP
     with open(os.path.join(EXPORT_DIR, "data.json"), "w") as f:
         json.dump(data_json, f, indent=2)
 
@@ -275,15 +315,19 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark V11 (Mobile/Tab Ready) 🚀"
+    return "Stark Secured Backend V13 (Auth + God Mode) 🔒"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
     if request.method == 'OPTIONS':
-        # Pre-flight request for Tablets
         return jsonify({"status": "ok"}), 200
 
-    log("🔵 New Request Received")
+    # 🔒 AUTH CHECK
+    if not is_authorized(request):
+        log("⛔ Unauthorized Access Attempt Blocked")
+        return jsonify({"error": "Unauthorized: Invalid Stark Secret"}), 403
+
+    log("🔵 New Authorized Request Received")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['pdf']
     
