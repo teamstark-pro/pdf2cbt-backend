@@ -50,10 +50,6 @@ def encode_image(image_path):
         return base64.b64encode(image_file.read()).decode('utf-8')
 
 def get_questions_per_page_batch(image_paths):
-    """
-    Sends a batch of images (max 2) to Groq.
-    Asks ONLY for the Question Numbers present, explicitly ignoring solutions.
-    """
     if not client or not image_paths: return None
     
     MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -63,21 +59,14 @@ def get_questions_per_page_batch(image_paths):
             {
                 "type": "text",
                 "text": """
-                Analyze these exam pages. Identify ONLY the Question Numbers for actual QUESTIONS.
+                Analyze these exam pages. Identify ONLY the Question Numbers present.
                 
-                CRITICAL RULES:
-                1. IGNORE any block labeled "Solution", "Answer", "Correct Answer", "Sol.", "Ans".
-                   (Example: If you see "Q18. Solution", DO NOT include 18).
-                2. IGNORE page numbers, marks, or section headers.
-                3. ONLY return integers of valid questions to be solved.
+                RULES:
+                1. Look for numbers at the START of question blocks (e.g., "1.", "Q1", "5)").
+                2. IGNORE numbers inside solutions.
+                3. Return JSON mapping image index to list of integers.
                 
-                Return JSON mapping image index to list of numbers:
-                {
-                    "img_0": [1, 2, 3],
-                    "img_1": [] 
-                }
-                
-                Output JSON ONLY.
+                Example: { "img_0": [1, 2, 3], "img_1": [4, 5] }
                 """
             }
         ]
@@ -113,26 +102,25 @@ def get_pdf_hash(path):
 def extract_questions_with_ai_guide(doc, page_map_guidance):
     extracted_data = []
     
-    # 1. Standard Regex for hunting
+    # 1. Regex List (Relaxed)
     regex_list = [
-        r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]",
-        r"^(\d+)\s*[\.\)]"
+        r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]", # Q.1, 1.
+        r"^(\d+)$" # Just "1" (Only accepted if in AI list)
     ]
     
-    # 2. THE ANTI-SOLUTION SHIELD (Python Layer)
-    # If text contains these, we skip it even if AI said "Yes"
+    # 2. FIXED BAD KEYWORDS (No more "Answer" banning)
     BAD_KEYWORDS = [
-        "Solution", "Sol.", "Answer", "Ans.", "Correct Answer", 
-        "Explanation", "Hint", "Step 1", "Hence", "Therefore"
+        "Solution", "Detailed Solution", "Correct Answer", 
+        "Correct Option", "Explanation", "Hint:"
     ]
     
-    top_m = 50
+    # 3. Safer Margins (Reduced Top Margin)
+    top_m = 10 # Was 50 (Too strict)
     bot_m = 50
     
     for page_num in range(len(doc)):
         allowed_numbers = page_map_guidance.get(page_num, [])
-        if not allowed_numbers:
-            continue
+        if not allowed_numbers: continue
             
         page = doc[page_num]
         height = page.rect.height
@@ -146,13 +134,11 @@ def extract_questions_with_ai_guide(doc, page_map_guidance):
             # Margins
             if y0 < top_m or y1 > height - bot_m: continue
             
-            # --- 🔥 FILTER: REJECT SOLUTIONS 🔥 ---
+            # Anti-Solution Check
             if any(bad in text for bad in BAD_KEYWORDS):
-                # log(f"   -> Skipped Solution Block: '{text[:20]}...'")
                 continue
 
-            # --- HYBRID CHECK ---
-            match_found = False
+            # Check Match
             for pat in regex_list:
                 try:
                     q_match = re.search(pat, text, re.IGNORECASE)
@@ -160,20 +146,19 @@ def extract_questions_with_ai_guide(doc, page_map_guidance):
                         q_no_str = next((g for g in q_match.groups() if g), None)
                         if not q_no_str: continue
                         
-                        q_val = int(q_no_str)
-                        
-                        # Verify against AI List
-                        if q_val in allowed_numbers:
-                            extracted_data.append({
-                                "label": q_no_str, 
-                                "x0": x0, "y0": y0, 
-                                "page": page_num, 
-                                "bbox": bbox
-                            })
-                            match_found = True
-                            break
+                        try:
+                            q_val = int(q_no_str)
+                            # Only accept if AI saw it on this page
+                            if q_val in allowed_numbers:
+                                extracted_data.append({
+                                    "label": q_no_str, 
+                                    "x0": x0, "y0": y0, 
+                                    "page": page_num, 
+                                    "bbox": bbox
+                                })
+                                break
+                        except: continue
                 except: continue
-                if match_found: break
 
     return extracted_data
 
@@ -187,15 +172,15 @@ def process_cbt_logic(pdf_path):
     doc = fitz.open(pdf_path)
     total_pages = len(doc)
     
-    # --- STEP 1: BATCH PROCESSING WITH GROQ ---
     FULL_PAGE_GUIDANCE = {}
     BATCH_SIZE = 2
     
+    # --- GROQ SCANNING ---
     for i in range(0, total_pages, BATCH_SIZE):
         batch_indices = range(i, min(i + BATCH_SIZE, total_pages))
         img_paths = []
         
-        log(f"🤖 Processing Pages {[b+1 for b in batch_indices]}...")
+        log(f"🤖 Scanning Pages {[b+1 for b in batch_indices]}...")
         
         for p_idx in batch_indices:
             pix = doc[p_idx].get_pixmap(dpi=100)
@@ -212,26 +197,29 @@ def process_cbt_logic(pdf_path):
                     found_qs = [int(x) for x in batch_data[key] if isinstance(x, (int, str)) and str(x).isdigit()]
                     FULL_PAGE_GUIDANCE[global_page_idx] = found_qs
                     if found_qs:
-                        log(f"   -> Page {global_page_idx+1}: Qs {found_qs}")
+                        log(f"   -> Page {global_page_idx+1}: Found {found_qs}")
         
-        time.sleep(0.5)
+        time.sleep(0.5) # Be nice to Groq
 
-    # --- STEP 2: EXTRACT USING AI GUIDANCE + FILTER ---
+    # --- EXTRACTION ---
     final_questions = extract_questions_with_ai_guide(doc, FULL_PAGE_GUIDANCE)
 
-    # --- FAILSAFE ---
+    # --- FALLBACK ---
     if not final_questions:
-        log("⚠️ AI found nothing. Checking for text-only PDF or Encryption.")
-        raise Exception("No valid questions found (Solutions skipped).")
+        log("⚠️ No Verified Questions. Falling back to Standard Regex (No AI Filter).")
+        # Reuse old reliable function if strict filter fails
+        config = {"top_margin": 20, "bottom_margin": 50, "left_margin": 0}
+        # Simplified internal extractor for fallback
+        final_questions = extract_questions_with_ai_guide(doc, {p: list(range(1, 500)) for p in range(len(doc))})
 
-    log(f"✅ Total Verified Questions: {len(final_questions)}")
+    log(f"✅ Final Questions: {len(final_questions)}")
 
     # --- JSON & CROP ---
     data_json = {
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
         "pdfCropperData": {SUBJECT_NAME: {SECTION_NAME: {}}},
         "appVersion": "1.30.0",
-        "generatedBy": "Team_Stark_V26_AntiSolution"
+        "generatedBy": "Team_Stark_V27"
     }
 
     final_questions.sort(key=lambda x: (x["page"], x["y0"]))
@@ -240,6 +228,7 @@ def process_cbt_logic(pdf_path):
         pg_h = doc[q["page"]].rect.height
         pg_w = doc[q["page"]].rect.width
         
+        # Full Width Crop
         x1 = 0
         x2 = pg_w
         json_x1 = 5
@@ -299,7 +288,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark V26 (Anti-Solution Shield) 🚀"
+    return "Team Stark V27 (Fixed Filter) 🚀"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
@@ -309,7 +298,7 @@ def upload_file():
     if not is_authorized(request):
         return jsonify({"error": "Unauthorized"}), 403
 
-    log("🔵 New Request (Page-by-Page + Shield)")
+    log("🔵 New Request")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['pdf']
     
