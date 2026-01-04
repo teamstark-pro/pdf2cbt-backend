@@ -11,9 +11,8 @@ import zipfile
 import io
 import sys
 import gc
-import random
-import google.generativeai as genai
-from google.api_core import exceptions as google_exceptions
+import base64
+from groq import Groq
 
 app = Flask(__name__)
 
@@ -39,85 +38,82 @@ def is_authorized(req):
     client_key = req.headers.get("x-stark-secret")
     return client_key == STARK_SECRET
 
-# --- 🔑 INTELLIGENT KEY ROTATION ---
-RAW_KEYS = os.environ.get("GEMINI_API_KEYS", "")
-# List of all available keys
-API_KEY_POOL = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
+# --- ⚡ GROQ VISION CLIENT ---
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+client = None
+if GROQ_API_KEY:
+    client = Groq(api_key=GROQ_API_KEY)
+else:
+    log("⚠️ WARNING: GROQ_API_KEY missing!")
 
-def get_ai_config_with_rotation(image_paths):
-    """
-    Loops through ALL keys until one works.
-    Stops 429 errors from killing the process.
-    """
-    if not API_KEY_POOL:
-        log("❌ CRITICAL: No API Keys found!")
+def encode_image(image_path):
+    """Encodes image to Base64 for Groq."""
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+def get_ai_config(image_paths):
+    if not client: return None
+    
+    # Groq Llama 3.2 Vision Model
+    MODEL_NAME = "llama-3.2-11b-vision-preview"
+    
+    try:
+        # We only take the first image for analysis to save tokens/complexity
+        # (Llama 3.2 handles single image context best right now)
+        base64_image = encode_image(image_paths[0])
+        
+        log(f"🤖 Asking Groq ({MODEL_NAME}) to analyze layout...")
+        
+        completion = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """
+                            You are a PDF Layout Analyzer. Look at this exam page image.
+                            I need to crop questions automatically.
+                            
+                            Return ONLY a valid JSON object with no markdown formatting.
+                            Keys required:
+                            1. "top_margin": Integer (Height in pixels of header to ignore. usually 50-100).
+                            2. "bottom_margin": Integer (Height in pixels of footer to ignore. usually 50).
+                            3. "regex_pattern": Python Regex string to find Question Number at start of line.
+                               - Example for "Q.1": "^Q\\\\.?[\\\\s-]?\\\\s?(\\\\d+)[\\\\.\\\\)]"
+                               - Example for "1 .": "^(\\\\d+)\\\\s*[\\\\.]"
+                            4. "is_two_column": Boolean (true if page has 2 vertical columns of questions).
+                            
+                            Output JSON only.
+                            """
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0.1, # Low temp for precise JSON
+            max_tokens=512,
+            top_p=1,
+            stream=False,
+            response_format={"type": "json_object"} # Force JSON mode
+        )
+        
+        resp_content = completion.choices[0].message.content
+        log(f"📥 Groq Response: {resp_content}")
+        
+        data = json.loads(resp_content)
+        log(f"✅ Groq Config Parsed: {data}")
+        return data
+
+    except Exception as e:
+        log(f"❌ Groq Error: {str(e)}")
         return None
-
-    # Shuffle keys to load balance, but try ALL of them if needed
-    keys_to_try = list(API_KEY_POOL)
-    random.shuffle(keys_to_try)
-
-    # Priority Model
-    MODEL_NAME = 'gemini-2.0-flash'
-
-    for key_index, current_key in enumerate(keys_to_try):
-        try:
-            # 1. Configure current key
-            masked_key = f"...{current_key[-4:]}"
-            log(f"🔑 Trying Key {key_index + 1}/{len(keys_to_try)} ({masked_key}) on {MODEL_NAME}...")
-            genai.configure(api_key=current_key)
-            
-            # 2. Setup Model
-            model = genai.GenerativeModel(MODEL_NAME)
-            content_parts = []
-            for path in image_paths:
-                content_parts.append(genai.upload_file(path))
-            
-            # 3. Enhanced Prompt (Fixes JSON Escape Error)
-            prompt = """
-            Analyze these exam pages. Return ONLY a valid JSON object.
-            
-            Fields:
-            1. "top_margin": Header height px (int).
-            2. "bottom_margin": Footer height px (int).
-            3. "regex_pattern": Python Regex string for Question Number at start of line.
-            4. "is_two_column": Boolean (true/false).
-            
-            IMPORTANT: 
-            - For Regex, ESCAPE ALL BACKSLASHES. Example: Use "^\\\\d+" instead of "^\\d+".
-            - Use "^Q\\\\.?[\\\\s-]?\\\\s?(\\\\d+)[\\\\.\\\\)]" for "Q.1" format.
-            - Do not include markdown formatting (```json).
-            """
-            content_parts.append(prompt)
-            
-            # 4. Request
-            result = model.generate_content(content_parts)
-            
-            # 5. Parse
-            raw_text = result.text.replace("```json", "").replace("```", "").strip()
-            # Clean potential bad escapes if AI ignored instruction
-            # (Basic attempt to fix common single backslash issues in JSON strings)
-            try:
-                data = json.loads(raw_text)
-            except json.JSONDecodeError as je:
-                log(f"⚠️ JSON Parse Error on Key {masked_key}: {je}. Retrying raw fix...")
-                # Last ditch effort: Escape single backslashes that aren't already escaped
-                fixed_text = raw_text.replace(r'\d', r'\\d').replace(r'\s', r'\\s').replace(r'\.', r'\\.')
-                data = json.loads(fixed_text)
-
-            log(f"✅ SUCCESS with Key {masked_key}: {data}")
-            return data
-
-        except google_exceptions.ResourceExhausted:
-            log(f"⚠️ Quota Exceeded (429) on Key {masked_key}. Switching to next key...")
-            continue # Try next key in loop
-            
-        except Exception as e:
-            log(f"❌ Error on Key {masked_key}: {str(e)[:100]}. Switching key just in case...")
-            continue # Try next key (maybe specific key is banned/bad)
-
-    log("💀 ALL KEYS FAILED. Usage limit reached on everything.")
-    return None
 
 # --- HELPER FUNCTIONS ---
 def get_pdf_hash(path):
@@ -182,24 +178,23 @@ def process_cbt_logic(pdf_path):
     pages_to_check = min(2, len(doc))
     img_paths = []
     for i in range(pages_to_check):
-        pix = doc[i].get_pixmap(dpi=100)
+        pix = doc[i].get_pixmap(dpi=150) # Better DPI for Vision
         p_path = os.path.join(UPLOAD_FOLDER, f"analyze_page_{i}.jpg")
         pix.save(p_path)
         img_paths.append(p_path)
 
-    # --- STRATEGY BUILDER ---
+    # Strategies
     strategies = []
     
-    # 1. AI STRATEGY (With True Rotation)
-    ai_data = get_ai_config_with_rotation(img_paths)
-    
+    # 1. GROQ AI STRATEGY
+    ai_data = get_ai_config(img_paths)
     if ai_data:
         strategies.append({
-            "name": "GEMINI_GOD_MODE",
-            "top_margin": ai_data.get("top_margin"),
-            "bottom_margin": ai_data.get("bottom_margin"),
+            "name": "GROQ_LLAMA_VISION",
+            "top_margin": ai_data.get("top_margin", 60),
+            "bottom_margin": ai_data.get("bottom_margin", 50),
             "regex_pattern": ai_data.get("regex_pattern"),
-            "is_two_column": ai_data.get("is_two_column")
+            "is_two_column": ai_data.get("is_two_column", False)
         })
 
     # 2. FALLBACK
@@ -210,6 +205,7 @@ def process_cbt_logic(pdf_path):
         "is_two_column": False 
     })
     
+    # 3. PANIC
     strategies.append({
         "name": "PANIC_MODE",
         "top_margin": 0, "bottom_margin": 0,
@@ -237,7 +233,7 @@ def process_cbt_logic(pdf_path):
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
         "pdfCropperData": {SUBJECT_NAME: {SECTION_NAME: {}}},
         "appVersion": "1.30.0",
-        "generatedBy": f"Team_Stark_{used_strategy}"
+        "generatedBy": f"Team_Stark_Groq_{used_strategy}"
     }
 
     force_two_col = active_config.get("is_two_column", False)
@@ -315,7 +311,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Stark V14 (Immortal Rotator) 🚀"
+    return "Team Stark Groq Vision Backend 🚀"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
@@ -323,10 +319,10 @@ def upload_file():
         return jsonify({"status": "ok"}), 200
 
     if not is_authorized(request):
-        log("⛔ Unauthorized Access")
+        log("⛔ Unauthorized")
         return jsonify({"error": "Unauthorized"}), 403
 
-    log("🔵 New Authorized Request Received")
+    log("🔵 New Authorized Request Received (Groq)")
     if 'pdf' not in request.files: return jsonify({"error": "No file part"}), 400
     file = request.files['pdf']
     
