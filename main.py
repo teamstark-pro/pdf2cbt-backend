@@ -27,15 +27,13 @@ def log(msg):
 GENAI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GENAI_API_KEY:
     genai.configure(api_key=GENAI_API_KEY)
-else:
-    log("⚠️ WARNING: GEMINI_API_KEY missing!")
 
-# --- 🧠 AI ANALYSIS (Auto-Switch Model) ---
+# --- 🧠 AI ANALYSIS ---
 def get_ai_config(image_paths):
     if not GENAI_API_KEY: return None
     
-    # Try Flash first, then Pro
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro']
+    # Updated Model Names
+    models_to_try = ['gemini-1.5-flash-001', 'gemini-1.5-pro-001', 'gemini-1.0-pro']
     
     for model_name in models_to_try:
         try:
@@ -46,12 +44,11 @@ def get_ai_config(image_paths):
                 content_parts.append(genai.upload_file(path))
             
             prompt = """
-            Analyze these exam pages. Return ONLY a JSON object.
-            1. "top_margin": Header height in pixels (e.g. 60).
-            2. "bottom_margin": Footer height in pixels (e.g. 50).
-            3. "regex_pattern": Python Regex to find Question Numbers at start of line.
-               - Matches: "Q.1", "1.", "(1)", "Q1", "1 )"
-               - STRICTLY NO equations or options.
+            Analyze exam pages. Return ONLY JSON.
+            1. "top_margin": Header height px (e.g. 60).
+            2. "bottom_margin": Footer height px (e.g. 50).
+            3. "regex_pattern": Regex for Question Start. 
+               Ex: "^Q\\.?[\\s-]?\\s?(\\d+)[\\.\\)]" or "^(\\d+)\\s*[\\.]"
             """
             content_parts.append(prompt)
             
@@ -61,8 +58,8 @@ def get_ai_config(image_paths):
             log(f"✅ AI Success ({model_name}): {data}")
             return data
         except Exception as e:
-            log(f"❌ {model_name} Failed: {e}")
-            continue # Try next model
+            log(f"❌ {model_name} Failed: {str(e)[:50]}...") # Short error
+            continue
             
     return None
 
@@ -86,29 +83,19 @@ def extract_questions_with_strategy(doc, strategy_name, top_m, bot_m, regex_patt
             bbox = b[:4]
             x0 = bbox[0]
 
-            # Filters
-            if bbox[1] < top_m or bbox[3] > height - bot_m: continue # Margins
-            if x0 > 80 and x0 < mid_x: continue # Indentation Lock
+            if bbox[1] < top_m or bbox[3] > height - bot_m: continue 
+            if x0 > 80 and x0 < mid_x: continue 
             if x0 > mid_x + 80: continue
-            if text.startswith("["): continue # Citations
+            if text.startswith("["): continue 
             if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", text, re.I): continue
 
             try:
-                # Regex Match
                 q_match = re.search(regex_pattern, text, re.IGNORECASE)
                 if q_match:
                     if any(x in text for x in ["Answer", "Solution", "Page", "Total"]): continue
-                    
-                    # Extract Number
-                    q_no_str = None
-                    for group in q_match.groups():
-                        if group: 
-                            q_no_str = group
-                            break
-                    
+                    q_no_str = next((g for g in q_match.groups() if g), None)
                     if not q_no_str: continue
-
-                    # Validation
+                    
                     try:
                         q_val = int(q_no_str)
                         if q_val <= 0 or q_val > 500: continue
@@ -118,8 +105,7 @@ def extract_questions_with_strategy(doc, strategy_name, top_m, bot_m, regex_patt
                         "label": q_no_str, 
                         "x0": bbox[0], "y0": bbox[1], 
                         "page": page_num, 
-                        "bbox": bbox,
-                        "text": text
+                        "bbox": bbox
                     })
             except: continue
             
@@ -134,7 +120,7 @@ def process_cbt_logic(pdf_path):
     
     doc = fitz.open(pdf_path)
     
-    # 1. Generate Images for AI
+    # Generate Images for AI
     pages_to_check = min(2, len(doc))
     img_paths = []
     for i in range(pages_to_check):
@@ -143,10 +129,8 @@ def process_cbt_logic(pdf_path):
         pix.save(p_path)
         img_paths.append(p_path)
 
-    # 2. DEFINE STRATEGIES (Hierarchy of Logic)
+    # Strategies
     strategies = []
-    
-    # Strategy A: AI (Priority 1)
     ai_data = get_ai_config(img_paths)
     if ai_data:
         strategies.append({
@@ -156,48 +140,32 @@ def process_cbt_logic(pdf_path):
             "regex": ai_data.get("regex_pattern")
         })
 
-    # Strategy B: Standard Fallback (Q.1, 1.)
     strategies.append({
         "name": "FALLBACK_STANDARD",
         "top": 50, "bot": 50,
         "regex": r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]"
     })
     
-    # Strategy C: Loose Fallback (1)
     strategies.append({
-        "name": "FALLBACK_LOOSE",
-        "top": 50, "bot": 50,
-        "regex": r"^(\d+)\s*[\.\)]"
-    })
-
-    # Strategy D: PANIC MODE (Brute Force - No margins, just numbers)
-    # Ye tab chalega jab sab fail ho jayein.
-    strategies.append({
-        "name": "PANIC_MODE_BRUTE_FORCE",
-        "top": 0, "bot": 0, # Scan Full Page
+        "name": "PANIC_MODE",
+        "top": 0, "bot": 0,
         "regex": r"^(\d+)"
     })
 
-    # 3. EXECUTE STRATEGIES
     final_questions = []
     used_strategy = "NONE"
     
     for strat in strategies:
         questions = extract_questions_with_strategy(doc, strat["name"], strat["top"], strat["bot"], strat["regex"])
-        
-        # Check if we found a reasonable amount of questions (at least 2)
         if len(questions) >= 2:
             log(f"✅ LOCKED! Found {len(questions)} questions using {strat['name']}")
             final_questions = questions
             used_strategy = strat["name"]
             break 
-        else:
-            log(f"⚠️ {strat['name']} found {len(questions)} (too few). Trying next...")
 
     if not final_questions:
-        raise Exception("Failed to crop ANY questions. PDF might be scanned images (OCR required).")
+        raise Exception("Failed to crop ANY questions.")
 
-    # 4. BUILD JSON & CROP IMAGES
     data_json = {
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
         "pdfCropperData": {SUBJECT_NAME: {SECTION_NAME: {}}},
@@ -205,29 +173,33 @@ def process_cbt_logic(pdf_path):
         "generatedBy": f"Team_Stark_{used_strategy}"
     }
 
+    # Process and Crop
     for i, q in enumerate(final_questions):
-        page_width = doc[q["page"]].rect.width
-        mid_x = page_width / 2
-        is_right_col = q["x0"] > mid_x
-        
-        # Smart Height Calculation
         pg_h = doc[q["page"]].rect.height
         pg_w = doc[q["page"]].rect.width
+        mid_x = pg_w / 2
+        is_right_col = q["x0"] > mid_x
         
-        # Default next Y is footer
-        next_q_y = pg_h - 50 
+        # Determine Next Y
+        next_q_y = pg_h - 50 # Default Footer
         
-        # Look ahead for next question
         if i + 1 < len(final_questions):
             nq = final_questions[i+1]
             if nq["page"] == q["page"]:
-                 # Check column consistency
                  nq_is_right = nq["x0"] > mid_x
                  if is_right_col == nq_is_right:
                      next_q_y = nq["y0"] - 15
 
-        height = next_q_y - q["y0"]
-        if height < 20: height = 150 # Safety buffer if calc fails
+        # --- 🔥 CRASH FIX: COORDINATE GUARD 🔥 ---
+        # Ensure we don't have negative height
+        y1_crop = max(0, q["y0"] - 30)
+        y2_crop = min(pg_h, next_q_y + 10)
+        
+        # If Logic fails (Bottom is higher than Top), Force a standard height
+        if y2_crop <= y1_crop:
+             log(f"⚠️ Bad Coords for Q{q['label']}: {y1_crop} to {y2_crop}. Fixing...")
+             y2_crop = y1_crop + 200 # Force 200px height
+             if y2_crop > pg_h: y2_crop = pg_h
 
         # JSON Coords
         data_json["pdfCropperData"][SUBJECT_NAME][SECTION_NAME][str(q["label"])] = {
@@ -235,8 +207,8 @@ def process_cbt_logic(pdf_path):
             "pdfData": [{
                 "x1": 5 if not is_right_col else 505, 
                 "x2": 495 if not is_right_col else 995, 
-                "y1": round(((q["y0"] - 25)/pg_h)*1000), 
-                "y2": round(((next_q_y + 10)/pg_h)*1000), 
+                "y1": round(((y1_crop + 5)/pg_h)*1000), # Adjusted to match crop
+                "y2": round(((y2_crop - 5)/pg_h)*1000), 
                 "page": q["page"] + 1
             }],
             "answerOptions": "4"
@@ -255,14 +227,18 @@ def process_cbt_logic(pdf_path):
         
         crop_box = (
             x1 * scale_w, 
-            max(0, q["y0"] - 30) * scale_h, 
+            y1_crop * scale_h, # Use Guarded Y1
             x2 * scale_w, 
-            min(pg_h, next_q_y + 10) * scale_h
+            y2_crop * scale_h  # Use Guarded Y2
         )
         
-        cropped = img.crop(crop_box)
-        img_name = f"{SECTION_NAME}__--__{q['label']}__--__1.png"
-        cropped.save(os.path.join(EXPORT_DIR, img_name))
+        try:
+            cropped = img.crop(crop_box)
+            img_name = f"{SECTION_NAME}__--__{q['label']}__--__1.png"
+            cropped.save(os.path.join(EXPORT_DIR, img_name))
+        except Exception as e:
+            log(f"❌ Crop Failed for Q{q['label']}: {e}")
+            # Do not crash, just skip image, JSON is already there
 
     # ZIP
     with open(os.path.join(EXPORT_DIR, "data.json"), "w") as f:
@@ -280,7 +256,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark Panic-Mode Backend V8 🚀"
+    return "Team Stark Stable Backend V9 🚀"
 
 @app.route('/process', methods=['POST'])
 def upload_file():
