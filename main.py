@@ -49,7 +49,12 @@ def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
-def get_questions_per_page_batch(image_paths):
+def get_clean_question_numbers(image_paths):
+    """
+    Asks Groq to act as a STRICT OCR FILTER.
+    Only returns numbers that belong to QUESTIONS.
+    Explicitly tells Groq to read text and exclude Solutions.
+    """
     if not client or not image_paths: return None
     
     MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -59,12 +64,23 @@ def get_questions_per_page_batch(image_paths):
             {
                 "type": "text",
                 "text": """
-                Analyze these exam pages. List ONLY the Question Numbers found.
+                You are an OCR Filter. Read these exam pages.
                 
-                RULES:
-                1. Look for numbers at the START of blocks (e.g. "1.", "Q1", "5)").
-                2. IGNORE numbers inside Solution/Answer/Hint blocks.
-                3. Return JSON: { "img_0": [1, 2, 3], "img_1": [4, 5] }
+                YOUR TASK:
+                Return a JSON list of Question Numbers (Integers) for ACTUAL QUESTIONS only.
+                
+                STRICT RULES:
+                1. If a number is followed by "Solution", "Ans", "Correct Answer", "Hint", or "Explanation" -> IGNORE IT.
+                2. If a number is just a Page Number or Marks -> IGNORE IT.
+                3. ONLY return the number if it starts a Question Statement.
+                
+                FORMAT:
+                {
+                    "img_0": [1, 2, 3],  // Found Q1, Q2, Q3 (Ignored Q1 Solution)
+                    "img_1": [4, 5]
+                }
+                
+                Output JSON ONLY.
                 """
             }
         ]
@@ -81,7 +97,7 @@ def get_questions_per_page_batch(image_paths):
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[{"role": "user", "content": message_content}],
-            temperature=0.1, max_tokens=500, top_p=1, stream=False,
+            temperature=0.1, max_tokens=1000, top_p=1, stream=False,
             response_format={"type": "json_object"}
         )
         
@@ -89,7 +105,7 @@ def get_questions_per_page_batch(image_paths):
         return data
 
     except Exception as e:
-        log(f"❌ Groq Batch Failed: {str(e)}")
+        log(f"❌ Groq OCR Failed: {str(e)}")
         return None
 
 # --- HELPER FUNCTIONS ---
@@ -97,24 +113,18 @@ def get_pdf_hash(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
 
-def extract_questions_strict_ai(doc, page_map_guidance):
+def extract_questions_groq_guided(doc, page_map_guidance):
     extracted_data = []
     
-    # 🔥 STRICT REGEX (Must be at Start of String)
-    # ^ ensures we don't match "20" inside "Length is 20cm"
-    regex_list = [
-        r"^\s*(?:Q|Question|Que|No)[\.\s\-]?\s*(\d+)",  # Matches "Q. 20", "Question 20"
-        r"^\s*(\d+)[\.\)\-\:]",                         # Matches "20.", "20)", "20-"
-        r"^\s*(\d+)\s*$"                                # Matches standalone "20"
-    ]
-    
-    # ❌ ANTI-SOLUTION SHIELD
-    BAD_KEYWORDS = ["Solution", "Detailed Solution", "Correct Answer", "Explanation", "Hint:", "Ans."]
+    # Simple Start-of-block Regex
+    # Matches "1.", "Q1", "Q.1", "1)" at the start of the text block
+    regex_pat = r"^\s*(?:Q|Question|Que|No)?[\.\s\-]?\s*(\d+)[\.\)\-\:]?"
     
     top_m = 0 
-    bot_m = 40 # Footer
+    bot_m = 40 # Footer buffer
     
     for page_num in range(len(doc)):
+        # What did Groq say about this page?
         allowed_numbers = page_map_guidance.get(page_num, [])
         if not allowed_numbers: continue
             
@@ -122,7 +132,7 @@ def extract_questions_strict_ai(doc, page_map_guidance):
         height = page.rect.height
         blocks = page.get_text("blocks")
         
-        # Track what we found to avoid duplicates
+        # Avoid duplicate captures on same page
         found_on_page = set()
 
         for b in blocks:
@@ -131,37 +141,27 @@ def extract_questions_strict_ai(doc, page_map_guidance):
             x0, y0, x1, y1 = bbox
             
             if y1 > height - bot_m: continue
-            if y0 < top_m: continue
             
-            # 1. Skip if Solution
-            if any(bad in text for bad in BAD_KEYWORDS): continue
-
-            # 2. Strict Start-of-Block Match
-            matched_num = None
-            for pat in regex_list:
-                # Using re.match or ^ anchor in search
-                m = re.search(pat, text, re.IGNORECASE)
-                if m:
-                    try:
-                        val = int(m.group(1))
-                        # Only accept if Groq said it's here
-                        if val in allowed_numbers:
-                            matched_num = str(val)
-                            # Only add if we haven't processed this Q yet (First occurrence wins)
-                            if val not in found_on_page:
-                                found_on_page.add(val)
-                                break
-                            else:
-                                matched_num = None # Duplicate on page (maybe header repetition)
-                    except: continue
-            
-            if matched_num:
-                extracted_data.append({
-                    "label": matched_num, 
-                    "x0": x0, "y0": y0, 
-                    "page": page_num, 
-                    "bbox": bbox
-                })
+            # --- BLIND OBEDIENCE CHECK ---
+            # 1. Check if block starts with a number
+            match = re.match(regex_pat, text, re.IGNORECASE)
+            if match:
+                try:
+                    val = int(match.group(1))
+                    
+                    # 2. ASK GROQ: "Is this number in your list?"
+                    if val in allowed_numbers:
+                        # 3. YES -> Crop it.
+                        if val not in found_on_page:
+                            extracted_data.append({
+                                "label": str(val), 
+                                "x0": x0, "y0": y0, 
+                                "page": page_num, 
+                                "bbox": bbox
+                            })
+                            found_on_page.add(val)
+                    # 4. NO -> Ignore it (It must be a solution or page number)
+                except: continue
 
     return extracted_data
 
@@ -176,55 +176,59 @@ def process_cbt_logic(pdf_path):
     total_pages = len(doc)
     
     FULL_PAGE_GUIDANCE = {}
-    BATCH_SIZE = 2
+    BATCH_SIZE = 2 # Process 2 pages at a time
     
-    # --- STEP 1: GROQ SCANNING ---
+    # --- STEP 1: ASK GROQ (THE GOD) ---
     for i in range(0, total_pages, BATCH_SIZE):
         batch_indices = range(i, min(i + BATCH_SIZE, total_pages))
         img_paths = []
         
-        log(f"🤖 Scanning Pages {[b+1 for b in batch_indices]}...")
+        log(f"🤖 Groq OCR Processing Pages {[b+1 for b in batch_indices]}...")
+        
         for p_idx in batch_indices:
             pix = doc[p_idx].get_pixmap(dpi=100)
             path = os.path.join(UPLOAD_FOLDER, f"batch_page_{p_idx}.jpg")
             pix.save(path)
             img_paths.append(path)
             
-        batch_data = get_questions_per_page_batch(img_paths)
+        # Get Clean List (No Solutions)
+        batch_data = get_clean_question_numbers(img_paths)
         
         if batch_data:
             for rel_idx, key in enumerate(sorted(batch_data.keys())):
                 if rel_idx < len(batch_indices):
                     global_page_idx = batch_indices[rel_idx]
-                    found_qs = [int(x) for x in batch_data[key] if isinstance(x, (int, str)) and str(x).isdigit()]
-                    if found_qs:
-                        FULL_PAGE_GUIDANCE[global_page_idx] = found_qs
-                        log(f"   -> Page {global_page_idx+1}: {found_qs}")
+                    # Parse Groq's list safely
+                    raw_list = batch_data[key]
+                    clean_qs = []
+                    for x in raw_list:
+                        if isinstance(x, int): clean_qs.append(x)
+                        elif isinstance(x, str) and x.isdigit(): clean_qs.append(int(x))
+                    
+                    if clean_qs:
+                        FULL_PAGE_GUIDANCE[global_page_idx] = clean_qs
+                        log(f"   -> Page {global_page_idx+1}: Authorized Qs {clean_qs}")
+        
         time.sleep(0.5)
 
-    # --- STEP 2: EXTRACT ---
-    final_questions = extract_questions_strict_ai(doc, FULL_PAGE_GUIDANCE)
+    # --- STEP 2: EXECUTE ORDERS ---
+    final_questions = extract_questions_groq_guided(doc, FULL_PAGE_GUIDANCE)
 
-    # --- FAILSAFE ---
+    # --- FAILSAFE (Only if Groq fails completely) ---
     if not final_questions:
-        log("⚠️ No Strict Matches. Falling back to Loose Search (Desperation Mode).")
-        # Reuse magnet logic (v28 style) only if strict failed
-        # But limited to AI numbers
-        final_questions = extract_questions_strict_ai(doc, FULL_PAGE_GUIDANCE) # (Strict failed, so empty)
-        # Try brute force all numbers 1-100 if completely empty
-        if not final_questions:
-             log("💀 AI Guidance failed. Brute forcing...")
-             # Just map every page to 1-100 to catch anything
-             final_questions = extract_questions_strict_ai(doc, {p: list(range(1, 100)) for p in range(len(doc))})
+        log("⚠️ Groq returned nothing. Trying Brute Force (All Numbers).")
+        # Map every page to all possible numbers 1-200 to catch *something*
+        fallback_map = {p: list(range(1, 200)) for p in range(len(doc))}
+        final_questions = extract_questions_groq_guided(doc, fallback_map)
 
+    log(f"✅ Final Questions Extracted: {len(final_questions)}")
 
-    log(f"✅ Extracted {len(final_questions)} Questions")
-
+    # --- JSON & CROP ---
     data_json = {
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
         "pdfCropperData": {SUBJECT_NAME: {SECTION_NAME: {}}},
         "appVersion": "1.30.0",
-        "generatedBy": "Team_Stark_V29_Strict"
+        "generatedBy": "Team_Stark_V30_GroqGod"
     }
 
     final_questions.sort(key=lambda x: (x["page"], x["y0"]))
@@ -233,6 +237,12 @@ def process_cbt_logic(pdf_path):
         pg_h = doc[q["page"]].rect.height
         pg_w = doc[q["page"]].rect.width
         
+        # Crop full width
+        x1 = 0
+        x2 = pg_w
+        json_x1 = 5
+        json_x2 = 995
+
         next_q_y = pg_h - 40 
         
         for j in range(i + 1, len(final_questions)):
@@ -240,15 +250,16 @@ def process_cbt_logic(pdf_path):
                 next_q_y = final_questions[j]["y0"] - 10
                 break
 
-        y1_crop = max(0, q["y0"] - 10) 
+        y1_crop = max(0, q["y0"] - 10) # Start slightly above number
         y2_crop = min(pg_h, next_q_y + 5)
         
+        # Minimum height safety
         if y2_crop - y1_crop < 50: y2_crop = y1_crop + 150
 
         data_json["pdfCropperData"][SUBJECT_NAME][SECTION_NAME][str(q["label"])] = {
             "que": q["label"], "type": "mcq", "marks": {"cm": 4, "im": -1},
             "pdfData": [{
-                "x1": 5, "x2": 995, 
+                "x1": json_x1, "x2": json_x2, 
                 "y1": round(((y1_crop)/pg_h)*1000), 
                 "y2": round(((y2_crop)/pg_h)*1000), 
                 "page": q["page"] + 1
@@ -288,7 +299,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark V29 (Strict Start-Block Logic) 🚀"
+    return "Team Stark V30 (Groq is God) 🚀"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
