@@ -1,6 +1,7 @@
-FROM python:3.9-slim
+# Use Python 3.11 to fix google.api_core and importlib errors
+FROM python:3.11-slim
 
-# Install system dependencies for PyMuPDF if needed
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -8,6 +9,8 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY requirements.txt .
+# Upgrade pip first
+RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
