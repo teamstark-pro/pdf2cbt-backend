@@ -23,28 +23,35 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 def log(msg):
     print(f"[STARK LOG] {msg}", file=sys.stdout, flush=True)
 
-# --- 🔑 CONFIG ---
+# --- 🔑 CONFIG & DIAGNOSTICS ---
 GENAI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GENAI_API_KEY:
     genai.configure(api_key=GENAI_API_KEY)
+    try:
+        log("🔍 Listing Available Gemini Models for this Key:")
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                log(f"   - {m.name}")
+    except Exception as e:
+        log(f"⚠️ Could not list models: {e}")
 
 # --- 🧠 AI ANALYSIS ---
 def get_ai_config(image_paths):
     if not GENAI_API_KEY: return None
     
-    # Updated Model Names
-    models_to_try = ['gemini-1.5-flash-001', 'gemini-1.5-pro-001', 'gemini-1.0-pro']
+    # Updated list based on common availability
+    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-1.0-pro', 'gemini-pro']
     
     for model_name in models_to_try:
         try:
-            log(f"🤖 Trying AI Model: {model_name}...")
+            log(f"🤖 Attempting AI Model: {model_name}...")
             model = genai.GenerativeModel(model_name)
             content_parts = []
             for path in image_paths:
                 content_parts.append(genai.upload_file(path))
             
             prompt = """
-            Analyze exam pages. Return ONLY JSON.
+            Analyze these exam pages. Return ONLY JSON.
             1. "top_margin": Header height px (e.g. 60).
             2. "bottom_margin": Footer height px (e.g. 50).
             3. "regex_pattern": Regex for Question Start. 
@@ -58,7 +65,7 @@ def get_ai_config(image_paths):
             log(f"✅ AI Success ({model_name}): {data}")
             return data
         except Exception as e:
-            log(f"❌ {model_name} Failed: {str(e)[:50]}...") # Short error
+            log(f"❌ {model_name} Error: {str(e)[:100]}") # Keep log short
             continue
             
     return None
@@ -84,10 +91,13 @@ def extract_questions_with_strategy(doc, strategy_name, top_m, bot_m, regex_patt
             x0 = bbox[0]
 
             if bbox[1] < top_m or bbox[3] > height - bot_m: continue 
-            if x0 > 80 and x0 < mid_x: continue 
-            if x0 > mid_x + 80: continue
             if text.startswith("["): continue 
             if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", text, re.I): continue
+
+            # Indentation Check (Loose for Panic Mode)
+            if "PANIC" not in strategy_name:
+                if x0 > 80 and x0 < mid_x: continue 
+                if x0 > mid_x + 80: continue
 
             try:
                 q_match = re.search(regex_pattern, text, re.IGNORECASE)
@@ -120,7 +130,7 @@ def process_cbt_logic(pdf_path):
     
     doc = fitz.open(pdf_path)
     
-    # Generate Images for AI
+    # Images for AI
     pages_to_check = min(2, len(doc))
     img_paths = []
     for i in range(pages_to_check):
@@ -173,41 +183,56 @@ def process_cbt_logic(pdf_path):
         "generatedBy": f"Team_Stark_{used_strategy}"
     }
 
-    # Process and Crop
+    # --- PROCESS AND CROP (FIXED LOGIC) ---
     for i, q in enumerate(final_questions):
         pg_h = doc[q["page"]].rect.height
         pg_w = doc[q["page"]].rect.width
         mid_x = pg_w / 2
+        
+        # --- SMART COLUMN DETECTION ---
+        # Check if ANY question on this page is on the right side
+        page_qs = [xq for xq in final_questions if xq["page"] == q["page"]]
+        has_right_col = any(xq["x0"] > mid_x + 20 for xq in page_qs)
+        
+        # If no questions on right side, it's SINGLE COLUMN -> Use Full Width
         is_right_col = q["x0"] > mid_x
         
-        # Determine Next Y
-        next_q_y = pg_h - 50 # Default Footer
+        # Determine X Coordinates
+        if has_right_col:
+            # Multi-column Logic
+            x1 = 0 if not is_right_col else mid_x
+            x2 = mid_x if not is_right_col else pg_w
+            json_x1 = 5 if not is_right_col else 505
+            json_x2 = 495 if not is_right_col else 995
+        else:
+            # Single Column Logic (FULL WIDTH)
+            x1 = 0
+            x2 = pg_w
+            json_x1 = 5
+            json_x2 = 995
+
+        # Determine Y Coordinates
+        next_q_y = pg_h - 50 
         
         if i + 1 < len(final_questions):
             nq = final_questions[i+1]
             if nq["page"] == q["page"]:
-                 nq_is_right = nq["x0"] > mid_x
-                 if is_right_col == nq_is_right:
+                 # In single column, just next question is fine
+                 # In multi column, check column alignment
+                 if not has_right_col or (is_right_col == (nq["x0"] > mid_x)):
                      next_q_y = nq["y0"] - 15
 
-        # --- 🔥 CRASH FIX: COORDINATE GUARD 🔥 ---
-        # Ensure we don't have negative height
+        # Coordinate Guard
         y1_crop = max(0, q["y0"] - 30)
         y2_crop = min(pg_h, next_q_y + 10)
-        
-        # If Logic fails (Bottom is higher than Top), Force a standard height
-        if y2_crop <= y1_crop:
-             log(f"⚠️ Bad Coords for Q{q['label']}: {y1_crop} to {y2_crop}. Fixing...")
-             y2_crop = y1_crop + 200 # Force 200px height
-             if y2_crop > pg_h: y2_crop = pg_h
+        if y2_crop <= y1_crop: y2_crop = y1_crop + 200
 
         # JSON Coords
         data_json["pdfCropperData"][SUBJECT_NAME][SECTION_NAME][str(q["label"])] = {
             "que": q["label"], "type": "mcq", "marks": {"cm": 4, "im": -1},
             "pdfData": [{
-                "x1": 5 if not is_right_col else 505, 
-                "x2": 495 if not is_right_col else 995, 
-                "y1": round(((y1_crop + 5)/pg_h)*1000), # Adjusted to match crop
+                "x1": json_x1, "x2": json_x2, 
+                "y1": round(((y1_crop + 5)/pg_h)*1000), 
                 "y2": round(((y2_crop - 5)/pg_h)*1000), 
                 "page": q["page"] + 1
             }],
@@ -222,14 +247,11 @@ def process_cbt_logic(pdf_path):
         scale_w = pix.width / pg_w
         scale_h = pix.height / pg_h
         
-        x1 = 0 if not is_right_col else mid_x
-        x2 = mid_x if not is_right_col else pg_w
-        
         crop_box = (
             x1 * scale_w, 
-            y1_crop * scale_h, # Use Guarded Y1
+            y1_crop * scale_h,
             x2 * scale_w, 
-            y2_crop * scale_h  # Use Guarded Y2
+            y2_crop * scale_h
         )
         
         try:
@@ -237,8 +259,7 @@ def process_cbt_logic(pdf_path):
             img_name = f"{SECTION_NAME}__--__{q['label']}__--__1.png"
             cropped.save(os.path.join(EXPORT_DIR, img_name))
         except Exception as e:
-            log(f"❌ Crop Failed for Q{q['label']}: {e}")
-            # Do not crash, just skip image, JSON is already there
+            log(f"❌ Crop Failed Q{q['label']}: {e}")
 
     # ZIP
     with open(os.path.join(EXPORT_DIR, "data.json"), "w") as f:
@@ -256,7 +277,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark Stable Backend V9 🚀"
+    return "Team Stark V10 (Full Width Fix) 🚀"
 
 @app.route('/process', methods=['POST'])
 def upload_file():
