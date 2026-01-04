@@ -51,13 +51,13 @@ def encode_image(image_path):
 def get_ai_config(image_paths):
     if not client or not image_paths: return None
     
-    # Analyze Page 0 (First Page) as requested
+    # Using Page 2 (Index 1) usually avoids Cover Pages/Instructions
     target_img = image_paths[0] 
     MODEL_NAME = "meta-llama/llama-4-scout-17b-16e-instruct"
     
     try:
         base64_img = encode_image(target_img)
-        log(f"🤖 Groq Processing Page 1 ({MODEL_NAME})...")
+        log(f"🤖 Groq Boss Analyzing Layout from {os.path.basename(target_img)}...")
         
         completion = client.chat.completions.create(
             model=MODEL_NAME,
@@ -68,19 +68,18 @@ def get_ai_config(image_paths):
                         {
                             "type": "text",
                             "text": """
-                            Analyze this exam page. I need to crop questions starting from this page.
+                            You are the Layout Master. Look at this exam page.
+                            Tell me EXACTLY how to crop it.
                             
-                            Return ONLY a JSON object with these EXACT keys:
-                            1. "top_margin": Int (Pixels to ignore at top header. Default 50).
-                            2. "bottom_margin": Int (Pixels to ignore at bottom footer. Default 50).
-                            3. "left_margin": Int (Pixels to ignore from left side. Default 0).
-                            4. "regex_pattern": Python Regex for Question Start.
-                               - IMPORTANT: Allow spaces! 
-                               - Use "^Q\\\\.?[\\\\s-]?\\\\s*(\\\\d+)[\\\\.\\\\)]" for "Q. 1" or "Q1".
-                               - Use "^(\\\\d+)\\\\s*[\\\\.]" for "1.".
+                            Return ONLY a JSON object:
+                            1. "top_margin": Int (Pixels to cut from top. e.g. 60).
+                            2. "bottom_margin": Int (Pixels to cut from bottom. e.g. 50).
+                            3. "left_margin": Int (Pixels to cut from left. e.g. 0).
+                            4. "regex_pattern": Python Regex for Question Number.
+                               - Example: "^Q\\\\.?[\\\\s-]?\\\\s*(\\\\d+)[\\\\.\\\\)]"
                                - ESCAPE ALL BACKSLASHES.
-                            5. "is_two_column": Boolean.
-                            6. "ignore_words": List of strings to explicitly skip (e.g. ["You didn't attempt", "Section A", "Page"]).
+                            5. "is_two_column": Boolean (True if it looks like 2 columns).
+                            6. "ignore_words": List[String] (Skip blocks containing these words e.g. ["Section A", "Rough Work"]).
                             
                             Output JSON only.
                             """
@@ -103,11 +102,11 @@ def get_ai_config(image_paths):
         
         resp_content = completion.choices[0].message.content
         data = json.loads(resp_content)
-        log(f"✅ AI Config: {data}")
+        log(f"✅ AI Boss Orders: {data}")
         return data
 
     except Exception as e:
-        log(f"❌ Groq Error: {str(e)}")
+        log(f"❌ AI Failed: {str(e)}")
         return None
 
 # --- HELPER FUNCTIONS ---
@@ -118,25 +117,22 @@ def get_pdf_hash(path):
 def extract_questions_with_strategy(doc, strategy_name, config):
     extracted_data = []
     
-    # 1. Unpack Config
+    # --- STRICT OBEDIENCE TO AI ---
     top_m = int(config.get("top_margin", 50))
     bot_m = int(config.get("bottom_margin", 50))
     left_m = int(config.get("left_margin", 0))
     ai_regex = config.get("regex_pattern", "")
     ignore_words = config.get("ignore_words", [])
     
-    # 2. Build Regex Priority List
+    # Priority Regex List (AI First)
     regex_list = []
-    if ai_regex: 
-        regex_list.append(ai_regex)
-    
-    # Standard Fallbacks (Safety Net)
+    if ai_regex: regex_list.append(ai_regex)
+    # Backups just in case AI gives invalid regex
     regex_list.append(r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]")
-    regex_list.append(r"^(\d+)\s*[\.\)]") 
+    regex_list.append(r"^(\d+)\s*[\.\)]")
 
-    log(f"🔄 Executing {strategy_name} | Margins: T{top_m}/B{bot_m}/L{left_m}")
+    log(f"🔄 Processing {len(doc)} pages | AI Margins: T{top_m}/B{bot_m}/L{left_m}")
 
-    # 3. Iterate ALL Pages (0 to End)
     for page_num in range(len(doc)):
         page = doc[page_num]
         height = page.rect.height
@@ -147,25 +143,22 @@ def extract_questions_with_strategy(doc, strategy_name, config):
             bbox = b[:4]
             x0, y0, x1, y1 = bbox
 
-            # --- FILTERS ---
-            # Geometric Filters
+            # 1. AI Margin Check
             if y0 < top_m or y1 > height - bot_m: continue
             if x0 < left_m: continue
             
-            # Text Filters
+            # 2. AI Ignore Words Check
             if any(w.lower() in text.lower() for w in ignore_words): continue
             
-            # Garbage Filters
+            # 3. Basic Garbage Filter
             if text.startswith("[") or re.search(r"@[a-z]+\.", text, re.I): continue
+            if any(x in text for x in ["Answer", "Solution", "Sol.", "Ans."]): continue
 
-            # --- REGEX MATCHING ---
+            # 4. Regex Match
             for pat in regex_list:
                 try:
                     q_match = re.search(pat, text, re.IGNORECASE)
                     if q_match:
-                        # Extra Validation to avoid "Page 1" being caught as Question 1
-                        if any(x in text for x in ["Answer", "Solution", "Page", "Total", "Marks"]): continue
-                        
                         q_no_str = next((g for g in q_match.groups() if g), None)
                         if not q_no_str: continue
                         
@@ -180,7 +173,7 @@ def extract_questions_with_strategy(doc, strategy_name, config):
                             "page": page_num, 
                             "bbox": bbox
                         })
-                        break # Found a match, stop checking regexes for this block
+                        break 
                 except: continue
             
     return extracted_data
@@ -194,13 +187,17 @@ def process_cbt_logic(pdf_path):
     
     doc = fitz.open(pdf_path)
     
-    # 1. Generate Page 0 Image (FIRST PAGE)
-    pix = doc[0].get_pixmap(dpi=150)
-    p_path = os.path.join(UPLOAD_FOLDER, "analyze_page_0.jpg")
+    # --- INTELLIGENT SAMPLING ---
+    # Try to scan Page 2 (index 1) to avoid Cover Page bias.
+    # If 1 page PDF, scan Page 1 (index 0).
+    target_page_idx = 1 if len(doc) > 1 else 0
+    
+    pix = doc[target_page_idx].get_pixmap(dpi=150)
+    p_path = os.path.join(UPLOAD_FOLDER, "analyze_target.jpg")
     pix.save(p_path)
     img_paths = [p_path]
 
-    # 2. Ask Groq
+    # Ask Groq
     ai_data = get_ai_config(img_paths)
     
     config = {
@@ -211,14 +208,14 @@ def process_cbt_logic(pdf_path):
     strategy_name = "FALLBACK_STD"
     if ai_data:
         config.update(ai_data)
-        strategy_name = "GROQ_SUPREMACY"
+        strategy_name = "GROQ_MASTER"
 
-    # 3. Extract from ALL pages
+    # Extract
     final_questions = extract_questions_with_strategy(doc, strategy_name, config)
 
-    # 4. Panic Mode (If extraction failed)
+    # Panic Mode
     if len(final_questions) == 0:
-        log("⚠️ No Qs found with AI Margins. Retrying with ZERO MARGINS...")
+        log("⚠️ AI Margins too strict? Retrying with Zero Margins...")
         config["top_margin"] = 0
         config["bottom_margin"] = 0
         config["left_margin"] = 0
@@ -227,7 +224,7 @@ def process_cbt_logic(pdf_path):
     if not final_questions:
         raise Exception("Failed to crop ANY questions.")
 
-    log(f"✅ Total Questions Found: {len(final_questions)}")
+    log(f"✅ Total Qs: {len(final_questions)}")
 
     data_json = {
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
@@ -236,6 +233,7 @@ def process_cbt_logic(pdf_path):
         "generatedBy": f"Team_Stark_{strategy_name}"
     }
 
+    # AI Dictated Column Logic
     force_two_col = config.get("is_two_column", False)
 
     for i, q in enumerate(final_questions):
@@ -312,7 +310,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark V21 (Groq Supremacy) 🚀"
+    return "Team Stark V22 (AI Boss Mode) 🚀"
 
 @app.route('/process', methods=['POST', 'OPTIONS'])
 def upload_file():
