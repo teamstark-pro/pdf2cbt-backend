@@ -27,20 +27,18 @@ def log(msg):
 GENAI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GENAI_API_KEY:
     genai.configure(api_key=GENAI_API_KEY)
-    try:
-        log("🔍 Listing Available Gemini Models for this Key:")
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                log(f"   - {m.name}")
-    except Exception as e:
-        log(f"⚠️ Could not list models: {e}")
 
 # --- 🧠 AI ANALYSIS ---
 def get_ai_config(image_paths):
     if not GENAI_API_KEY: return None
     
-    # Updated list based on common availability
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-1.0-pro', 'gemini-pro']
+    # 🔥 UPDATED MODELS BASED ON YOUR LOGS 🔥
+    models_to_try = [
+        'gemini-2.0-flash',       # Latest Fast Model
+        'gemini-2.5-flash',       # Preview Model
+        'gemini-flash-latest',    # Auto-latest
+        'gemini-2.0-flash-lite'   # Super cheap/fast
+    ]
     
     for model_name in models_to_try:
         try:
@@ -141,6 +139,8 @@ def process_cbt_logic(pdf_path):
 
     # Strategies
     strategies = []
+    
+    # Strategy 1: AI (With corrected Model Names)
     ai_data = get_ai_config(img_paths)
     if ai_data:
         strategies.append({
@@ -150,12 +150,14 @@ def process_cbt_logic(pdf_path):
             "regex": ai_data.get("regex_pattern")
         })
 
+    # Strategy 2: Standard Fallback
     strategies.append({
         "name": "FALLBACK_STANDARD",
         "top": 50, "bot": 50,
         "regex": r"^(?:Q|Question|Que|No|Problem)?[\.\s\-]?\s*(\d+)[\.\)\-]"
     })
     
+    # Strategy 3: Panic Mode
     strategies.append({
         "name": "PANIC_MODE",
         "top": 0, "bot": 0,
@@ -183,7 +185,7 @@ def process_cbt_logic(pdf_path):
         "generatedBy": f"Team_Stark_{used_strategy}"
     }
 
-    # --- PROCESS AND CROP (FIXED LOGIC) ---
+    # --- PROCESS AND CROP ---
     for i, q in enumerate(final_questions):
         pg_h = doc[q["page"]].rect.height
         pg_w = doc[q["page"]].rect.width
@@ -217,8 +219,6 @@ def process_cbt_logic(pdf_path):
         if i + 1 < len(final_questions):
             nq = final_questions[i+1]
             if nq["page"] == q["page"]:
-                 # In single column, just next question is fine
-                 # In multi column, check column alignment
                  if not has_right_col or (is_right_col == (nq["x0"] > mid_x)):
                      next_q_y = nq["y0"] - 15
 
@@ -277,7 +277,7 @@ def process_cbt_logic(pdf_path):
 # --- FLASK ROUTES ---
 @app.route('/')
 def home():
-    return "Team Stark V10 (Full Width Fix) 🚀"
+    return "Team Stark V11 (Gemini 2.0 Integrated) 🚀"
 
 @app.route('/process', methods=['POST'])
 def upload_file():
