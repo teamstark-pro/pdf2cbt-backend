@@ -30,24 +30,23 @@ def process_cbt_logic(pdf_path):
     os.makedirs(EXPORT_DIR, exist_ok=True)
     
     # --- NAMING CONFIGURATION ---
-    # User Request: "Mathematics Section 1" ki jagah "Stark"
     SECTION_NAME = "Stark"
-    SUBJECT_NAME = "Stark" # Subject bhi Stark rakha hai safe side ke liye
+    SUBJECT_NAME = "Stark"
     
     data_json = {
         "testConfig": {"pdfFileHash": get_pdf_hash(pdf_path)},
         "pdfCropperData": {SUBJECT_NAME: {SECTION_NAME: {}}},
         "appVersion": "1.30.0",
-        "generatedBy": "Team_Stark_IntelliCropper_V3"
+        "generatedBy": "Team_Stark_IntelliCropper_V4"
     }
     
     doc = fitz.open(pdf_path)
     
-    # 2. BALANCED REGEX (Detects 'Q1', '1.', 'Q 1', '1)')
-    # Changes: Added \s back to allow "Question 1 " but logic will filter garbage
+    # REGEX UPDATE: Strict checking for Question Numbers
+    # Matches: "Q1.", "1.", "Q 1", "1)"
     MASTER_REGEX = r"^(Q|Question|Que|Problem|Prob|No|S)?[\.\s\-]?\s?(\d+)[\.\)\-\s]"
     
-    print(f"Processing {len(doc)} pages...")
+    print(f"Processing {len(doc)} pages with STARK Logic V4...")
 
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -62,25 +61,28 @@ def process_cbt_logic(pdf_path):
             text = b[4].strip()
             bbox = b[:4]
             
-            # --- LOGIC 1: IGNORE HEADER/FOOTER ---
-            # Top 70px aur Bottom 70px ko chhod do (Page nums, Headers)
-            if bbox[1] < 70 or bbox[3] > height - 70:
+            # --- FILTER 1: IGNORE HEADERS/FOOTERS ---
+            if bbox[1] < 60 or bbox[3] > height - 60:
                 continue
 
-            # Anti-Noise
+            # --- FILTER 2: IGNORE CITATIONS & BRACKETS ---
+            # Agar line '[' se start hoti hai (e.g.,), toh ignore karo
+            if text.startswith("["): 
+                continue
+
+            # Anti-Noise (Emails)
             if re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", text, re.I): continue
 
             q_match = re.match(MASTER_REGEX, text, re.IGNORECASE)
             if q_match:
                 if any(x in text for x in ["Answer", "Solution", "Page", "Total", "Notes", "Marks"]): continue
                 
-                # Extract Number
                 q_no_str = q_match.group(2)
                 
-                # --- LOGIC 2: RANGE CHECK (KILL 1048) ---
+                # --- FILTER 3: RANGE CHECK (KILL 1048) ---
                 try:
                     q_val = int(q_no_str)
-                    # Agar number 0 hai ya 500 se bada hai, toh ye garbage hai
+                    # Agar number 500 se bada hai, toh pakka garbage/citation hai
                     if q_val <= 0 or q_val > 500:
                         continue
                 except:
@@ -100,19 +102,17 @@ def process_cbt_logic(pdf_path):
         else:
             columns = [(sorted(all_q, key=lambda x: x['y0']), 0, width)]
 
-        # Crop & Json
+        # Crop & Json Logic
         for col_questions, start_x, end_x in columns:
             for i, q in enumerate(col_questions):
                 q_id = q["label"]
                 top_y = q["y0"]
                 
-                # Smart Bottom Calculation
                 if i + 1 < len(col_questions):
                     bottom_y = col_questions[i+1]["y0"] - 15
                 else:
-                    bottom_y = height - 60 # Page footer margin
+                    bottom_y = height - 50
 
-                # Skip Tiny Crops
                 if (bottom_y - top_y) < 20: continue
 
                 # JSON Data
@@ -147,6 +147,7 @@ def process_cbt_logic(pdf_path):
                 )
                 
                 cropped = img.crop(crop_box)
+                
                 # Filename format: Stark__--__1__--__1.png
                 img_name = f"{SECTION_NAME}__--__{q_id}__--__1.png"
                 cropped.save(os.path.join(EXPORT_DIR, img_name))
@@ -168,7 +169,7 @@ def process_cbt_logic(pdf_path):
 
 @app.route('/')
 def home():
-    return "Team Stark Backend V3 is LIVE! 🚀"
+    return "Team Stark Backend V4 is LIVE! 🚀"
 
 @app.route('/process', methods=['POST'])
 def upload_file():
