@@ -38,10 +38,8 @@ jobs = {}
 STARK_SECRET = os.environ.get("STARK_SECRET_KEY", "open_access_mode")
 
 # --- MODEL CONFIGURATION ---
-# Updated to 90b as 11b was decommissioned. 
-# You can also try 'llama-3.2-11b-vision-preview' if it comes back, 
-# or check https://console.groq.com/docs/models for the latest list.
-CURRENT_VISION_MODEL = "llama-3.2-90b-vision-preview" 
+# Updated to the specific model requested by user
+CURRENT_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # --- SMARTER GROQ MANAGER ---
 class SmartGroqManager:
@@ -106,6 +104,7 @@ class SmartGroqManager:
                      # Break loop as retrying won't fix a decommissioned model
                      break 
                 logger.error(f"❌ Bad Request: {str(e)}")
+                # If image is too large (413), we might want to catch that, but generic logging covers it.
                 break
             except Exception as e:
                 logger.error(f"❌ Groq Error: {str(e)}")
@@ -131,9 +130,16 @@ def get_pdf_hash(path):
 def pixmap_to_base64(pix):
     """Convert PyMuPDF Pixmap to base64 string in memory"""
     try:
-        img_data = pix.tobytes("png")
+        # Optimization: Use JPEG instead of PNG.
+        # The new models have a strict 4MB base64 limit. 
+        # PNGs often exceed this. JPEGs are much safer.
+        if pix.alpha:
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+        
+        img_data = pix.tobytes("jpeg", jpg_quality=85)
         return base64.b64encode(img_data).decode('utf-8')
     except Exception as e:
+        logger.error(f"Image encoding error: {e}")
         return ""
 
 def log_job(job_id, msg):
@@ -168,8 +174,12 @@ def get_questions_ai(job_id, doc, page_indices):
     for i, p_idx in enumerate(page_indices):
         try:
             page = doc[p_idx]
+            # 100 DPI is sufficient for AI reading and keeps size low
             pix = page.get_pixmap(dpi=100)
             b64 = pixmap_to_base64(pix)
+            
+            if not b64: continue
+
             key = f"img_{i}"
             valid_map[key] = p_idx
             
