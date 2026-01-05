@@ -12,6 +12,7 @@ import random
 import re
 import gc
 import zipfile
+import concurrent.futures
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 import fitz  # PyMuPDF
@@ -125,7 +126,7 @@ def pixmap_to_base64(pix):
 def get_questions_ai_coordinates(job_id, doc, page_indices):
     """
     Asks Groq to return not just the question number, but the Y-COORDINATE (0-1000 scale).
-    This removes the need for Regex searching later.
+    Optimized prompt for better accuracy.
     """
     payload_content = [
         {
@@ -140,19 +141,17 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
             1. Return a JSON object where keys are the image labels (e.g., "img_0").
             2. The value must be a LIST of objects containing:
                - "q_num": The question number (integer).
-               - "y_start": The vertical Y-coordinate where this question starts (on a scale of 0 to 1000). 0 is top, 1000 is bottom.
+               - "y_start": The vertical Y-coordinate where the question number visually starts (scale 0-1000).
+            
+            ACCURACY TIP:
+            - Look for the whitespace ABOVE the question number. 
+            - Set "y_start" to the top edge of the Question Number text (e.g., "Q1", "1.").
             
             EXAMPLE OUTPUT:
-            {
-              "img_0": [
-                {"q_num": 1, "y_start": 50},
-                {"q_num": 2, "y_start": 450}
-              ]
-            }
+            { "img_0": [ {"q_num": 1, "y_start": 50}, {"q_num": 2, "y_start": 450} ] }
             
             IGNORE:
             - Solutions, Answers, Explanations.
-            - Headers/Footers.
             """
         }
     ]
@@ -162,7 +161,7 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
     for i, p_idx in enumerate(page_indices):
         try:
             page = doc[p_idx]
-            pix = page.get_pixmap(dpi=100) # Low DPI is fine for layout analysis
+            pix = page.get_pixmap(dpi=100)
             b64 = pixmap_to_base64(pix)
             if not b64: continue
 
@@ -185,114 +184,87 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                 real_page_idx = valid_map[img_key]
                 cleaned_items = []
                 
-                # Robust parsing of AI response
                 if isinstance(item_list, list):
                     for item in item_list:
                         try:
-                            # Handle string inputs gracefully
                             q_num = int(str(item.get("q_num", "")).strip())
                             y_start = int(str(item.get("y_start", "0")).strip())
                             cleaned_items.append({"q": q_num, "y": y_start})
                         except: pass
                 
-                # Sort by Y position to be safe
                 cleaned_items.sort(key=lambda x: x["y"])
                 result_map[real_page_idx] = cleaned_items
                 
     return result_map
 
 def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
-    """
-    Uses ONLY the coordinates provided by Groq. No Regex.
-    """
-    # Flatten map into a sortable list
     all_qs_coords = []
     
     for p_idx, items in vision_map.items():
         page_h = doc[p_idx].rect.height
-        
         for item in items:
-            # Convert 0-1000 scale to actual PDF points
             normalized_y = item['y']
             actual_y = (normalized_y / 1000.0) * page_h
-            
             all_qs_coords.append({
                 "label": str(item['q']),
                 "page": p_idx,
                 "y0": actual_y
             })
 
-    # Sort: Primary by Page, Secondary by Y-position
     all_qs_coords.sort(key=lambda x: (x["page"], x["y0"]))
-    
     log_job(job_id, f"✅ AI identified {len(all_qs_coords)} start points directly.", "INFO")
     
-    if not all_qs_coords:
-        return []
+    if not all_qs_coords: return []
 
-    # 2. CROP & STITCH
     final_output = []
     
     for i, q in enumerate(all_qs_coords):
         curr_p = q["page"]
         
-        # Buffer: Start slightly above the AI's detected point to catch the top of the number
+        # Buffer: Start slightly above detected point
         y_start = max(0, q["y0"] - 15)
         
-        # Determine End Point (Cut Logic)
         if i + 1 < len(all_qs_coords):
             next_q = all_qs_coords[i+1]
             if next_q["page"] == curr_p:
-                # Next question is on the same page
-                # Cut slightly before the next question starts
+                # Same page: Cut before next Q
                 y_end = max(y_start + 20, next_q["y0"] - 10)
             else:
-                # Next question is on a later page
-                # Take until bottom of current page
-                y_end = doc[curr_p].rect.height - 40 # Bottom margin buffer
+                # Next page: Take until bottom
+                y_end = doc[curr_p].rect.height - 40
         else:
-            # Last question of the whole doc
             y_end = doc[curr_p].rect.height - 40
 
-        # Stitching Logic (Handling Multi-Page Questions)
         pages_to_process = []
         
-        # Scenario A: Single Page Segment
+        # A: Same Page
         if i + 1 < len(all_qs_coords) and all_qs_coords[i+1]["page"] == curr_p:
              pages_to_process.append((curr_p, y_start, y_end))
         
-        # Scenario B: Multi-Page Segment
+        # B: Multi-Page
         elif i + 1 < len(all_qs_coords) and all_qs_coords[i+1]["page"] > curr_p:
-            # 1. Remainder of Current Page
             pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 40))
-            
-            # 2. Full Intermediate Pages
             for gap_p in range(curr_p + 1, all_qs_coords[i+1]["page"]):
                 pages_to_process.append((gap_p, 40, doc[gap_p].rect.height - 40))
             
-            # 3. Top of Next Page (until next Q starts)
             next_p_idx = all_qs_coords[i+1]["page"]
             next_q_y = all_qs_coords[i+1]["y0"] - 15
-            # Ensure we don't have negative height
             next_q_y = max(50, next_q_y) 
             pages_to_process.append((next_p_idx, 40, next_q_y))
             
-        # Scenario C: Very Last Question
+        # C: Last Q
         else:
             pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 40))
 
-        # Render Images
         images = []
         total_h = 0
         max_w = 0
         
         for p_idx_s, y_s, y_e in pages_to_process:
-            if y_e <= y_s: continue # Skip invalid segments
+            if y_e <= y_s: continue
             
             page = doc[p_idx_s]
             rect = fitz.Rect(0, y_s, page.rect.width, y_e)
-            
-            # High DPI for final output quality
             pix = page.get_pixmap(dpi=200, clip=rect)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             
@@ -302,14 +274,12 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         
         if not images: continue
         
-        # Stitch
         final_img = Image.new('RGB', (max_w, total_h), (255, 255, 255))
         current_y = 0
         for img in images:
             final_img.paste(img, (0, current_y))
             current_y += img.height
         
-        # Save
         img_filename = f"Stark__--__{q['label']}__--__1.png"
         save_path = os.path.join(export_dir, img_filename)
         
@@ -318,11 +288,7 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
              save_path = os.path.join(export_dir, img_filename)
 
         final_img.save(save_path)
-        
-        final_output.append({
-            "label": q['label'],
-            "filename": img_filename
-        })
+        final_output.append({"label": q['label'], "filename": img_filename})
         
     return final_output
 
@@ -337,26 +303,35 @@ def worker_process(job_id, pdf_path, job_dir):
         
         total_pages = len(doc)
         FULL_VISION_DATA = {}
-        BATCH_SIZE = 2
         
-        # PHASE 1: VISION SCAN (Coordinates)
+        # --- PARALLEL BATCH PROCESSING ---
+        BATCH_SIZE = 4 # Increased from 2 to 4 (Max 5 images per req)
+        batches = []
+        
+        # Prepare batches
         for i in range(0, total_pages, BATCH_SIZE):
-            batch_indices = range(i, min(i + BATCH_SIZE, total_pages))
-            log_job(job_id, f"🤖 Vision Scanning Pages {[b+1 for b in batch_indices]}...", "INFO")
+            indices = list(range(i, min(i + BATCH_SIZE, total_pages)))
+            batches.append(indices)
             
-            # Now returns coordinates too!
-            batch_data = get_questions_ai_coordinates(job_id, doc, list(batch_indices))
-            
-            if batch_data:
-                for k, v in batch_data.items():
-                    FULL_VISION_DATA[k] = v
-                    # Log concise summary
-                    q_nums = [x['q'] for x in v]
-                    log_job(job_id, f"   -> Page {k+1}: Found Qs {q_nums}", "INFO")
-            
-            time.sleep(0.5)
+        log_job(job_id, f"⚡ Parallel Scanning {len(batches)} batches...", "INFO")
 
-        # PHASE 2: CROP (Pure Vision)
+        # Define wrapper for thread executor
+        def process_batch(indices):
+            return indices, get_questions_ai_coordinates(job_id, doc, indices)
+
+        # Run concurrently
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_batch = {executor.submit(process_batch, b): b for b in batches}
+            
+            for future in concurrent.futures.as_completed(future_to_batch):
+                indices, result = future.result()
+                if result:
+                    for k, v in result.items():
+                        FULL_VISION_DATA[k] = v
+                        q_nums = [x['q'] for x in v]
+                        log_job(job_id, f"   -> Page {k+1}: Found Qs {q_nums}", "INFO")
+
+        # PHASE 2: CROP
         log_job(job_id, "✂️ Cropping based on Vision Coordinates...", "INFO")
         final_qs = extract_and_stitch_pure_vision(job_id, doc, FULL_VISION_DATA, export_dir)
         
@@ -377,8 +352,7 @@ def worker_process(job_id, pdf_path, job_dir):
             key = q['label']
             if "_" in q['filename']:
                  try:
-                    key_part = q['filename'].split("__--__")[1]
-                    key = key_part
+                    key = q['filename'].split("__--__")[1]
                  except: pass
 
             data_json["pdfCropperData"]["Stark"]["Stark"][key] = {
@@ -386,9 +360,7 @@ def worker_process(job_id, pdf_path, job_dir):
                 "type": "mcq",
                 "marks": {"cm": 4, "im": -1},
                 "answerOptions": "4",
-                "pdfData": [{
-                    "x1": 5, "x2": 995, "y1": 100, "y2": 500, "page": 1
-                }]
+                "pdfData": [{"x1": 5, "x2": 995, "y1": 100, "y2": 500, "page": 1}]
             }
         
         with open(os.path.join(export_dir, "data.json"), "w") as f:
@@ -456,7 +428,7 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Pure Vision Mode) 🚀"
+    return "Team Stark V33 (Parallel Vision Mode) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
