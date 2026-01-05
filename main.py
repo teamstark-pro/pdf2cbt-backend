@@ -29,22 +29,12 @@ BASE_TEMP_DIR = "/tmp/stark_processor"
 os.makedirs(BASE_TEMP_DIR, exist_ok=True)
 
 # --- IMPROVED LOGGING FOR RAILWAY ---
-# Railway captures stdout. We format it clearly with the Job ID.
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("StarkLogger")
 
 def log_job(job_id, msg, level="INFO"):
-    """
-    Logs to both the internal memory (for frontend status) and stdout (for Railway).
-    Forces flush to ensure logs appear immediately in Railway.
-    """
     timestamp = time.strftime("%H:%M:%S")
-    
-    # 1. Console Output (Railway)
-    # Format: [JOB_ID] [LEVEL] Message
     print(f"[{job_id}] [{level}] {msg}", file=sys.stdout, flush=True)
-    
-    # 2. Memory Output (Frontend)
     if job_id in jobs:
         jobs[job_id]["logs"].append(f"[{timestamp}] {msg}")
 
@@ -61,17 +51,13 @@ class SmartGroqManager:
         raw_keys = os.environ.get("GROQ_API_KEYS", "")
         self.all_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
         self.key_cooldowns = {k: 0 for k in self.all_keys}
-        
         if not self.all_keys:
             log_job("SYSTEM", "⚠️ No GROQ_API_KEYS found!", "WARN")
 
     def get_client(self):
-        if not self.all_keys:
-            return None, None
-        
+        if not self.all_keys: return None, None
         now = time.time()
         available_keys = [k for k in self.all_keys if now >= self.key_cooldowns[k]]
-        
         if not available_keys:
             selected_key = min(self.key_cooldowns, key=self.key_cooldowns.get)
             wait_time = max(0, self.key_cooldowns[selected_key] - now)
@@ -80,7 +66,6 @@ class SmartGroqManager:
                 time.sleep(wait_time)
         else:
             selected_key = random.choice(available_keys)
-            
         return Groq(api_key=selected_key), selected_key
 
     def mark_rate_limited(self, key):
@@ -91,19 +76,14 @@ class SmartGroqManager:
         for attempt in range(retries):
             client, key_used = self.get_client()
             if not client: return None
-
             try:
                 completion = client.chat.completions.create(
                     model=CURRENT_VISION_MODEL,
                     messages=[{"role": "user", "content": message_payload}],
-                    temperature=0.1,
-                    max_tokens=4096,
-                    top_p=1,
-                    stream=False,
+                    temperature=0.1, max_tokens=4096, top_p=1, stream=False,
                     response_format={"type": "json_object"}
                 )
                 return json.loads(completion.choices[0].message.content)
-
             except RateLimitError:
                 self.mark_rate_limited(key_used)
                 time.sleep(1)
@@ -135,25 +115,44 @@ def get_pdf_hash(path):
 
 def pixmap_to_base64(pix):
     try:
-        if pix.alpha:
-            pix = fitz.Pixmap(fitz.csRGB, pix)
+        if pix.alpha: pix = fitz.Pixmap(fitz.csRGB, pix)
         img_data = pix.tobytes("jpeg", jpg_quality=85)
         return base64.b64encode(img_data).decode('utf-8')
-    except Exception as e:
-        return ""
+    except Exception as e: return ""
 
 # --- CORE LOGIC ---
 
-def get_questions_ai(job_id, doc, page_indices):
+def get_questions_ai_coordinates(job_id, doc, page_indices):
+    """
+    Asks Groq to return not just the question number, but the Y-COORDINATE (0-1000 scale).
+    This removes the need for Regex searching later.
+    """
     payload_content = [
         {
             "type": "text",
             "text": """
-            Analyze these exam pages. Identify Question Numbers.
-            RULES:
-            1. Report EVERY question number you see starting a block (e.g., "1.", "Q2", "Q.3", "4)").
-            2. IGNORE numbers inside "Solution", "Answer" blocks.
-            3. Return JSON: { "img_0": [1, 2, 3], "img_1": [4, 5] }
+            Analyze these exam pages.
+            
+            TASK:
+            Identify the START of every question.
+            
+            CRITICAL OUTPUT RULES:
+            1. Return a JSON object where keys are the image labels (e.g., "img_0").
+            2. The value must be a LIST of objects containing:
+               - "q_num": The question number (integer).
+               - "y_start": The vertical Y-coordinate where this question starts (on a scale of 0 to 1000). 0 is top, 1000 is bottom.
+            
+            EXAMPLE OUTPUT:
+            {
+              "img_0": [
+                {"q_num": 1, "y_start": 50},
+                {"q_num": 2, "y_start": 450}
+              ]
+            }
+            
+            IGNORE:
+            - Solutions, Answers, Explanations.
+            - Headers/Footers.
             """
         }
     ]
@@ -163,7 +162,7 @@ def get_questions_ai(job_id, doc, page_indices):
     for i, p_idx in enumerate(page_indices):
         try:
             page = doc[p_idx]
-            pix = page.get_pixmap(dpi=100)
+            pix = page.get_pixmap(dpi=100) # Low DPI is fine for layout analysis
             b64 = pixmap_to_base64(pix)
             if not b64: continue
 
@@ -181,143 +180,136 @@ def get_questions_ai(job_id, doc, page_indices):
     
     result_map = {}
     if response:
-        for img_key, q_list in response.items():
+        for img_key, item_list in response.items():
             if img_key in valid_map:
                 real_page_idx = valid_map[img_key]
-                # Filter strictly for integers
-                clean_qs = [int(x) for x in q_list if str(x).isdigit()]
-                result_map[real_page_idx] = clean_qs
+                cleaned_items = []
+                
+                # Robust parsing of AI response
+                if isinstance(item_list, list):
+                    for item in item_list:
+                        try:
+                            # Handle string inputs gracefully
+                            q_num = int(str(item.get("q_num", "")).strip())
+                            y_start = int(str(item.get("y_start", "0")).strip())
+                            cleaned_items.append({"q": q_num, "y": y_start})
+                        except: pass
+                
+                # Sort by Y position to be safe
+                cleaned_items.sort(key=lambda x: x["y"])
+                result_map[real_page_idx] = cleaned_items
                 
     return result_map
 
-def extract_and_stitch(job_id, doc, page_map, export_dir):
-    # Flatten map
-    all_qs_targets = []
-    for p_idx, qs in page_map.items():
-        for q in qs:
-            all_qs_targets.append({"page": p_idx, "val": q})
+def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
+    """
+    Uses ONLY the coordinates provided by Groq. No Regex.
+    """
+    # Flatten map into a sortable list
+    all_qs_coords = []
     
-    all_qs_targets.sort(key=lambda x: (x["page"], x["val"]))
-
-    # --- IMPROVED REGEX ---
-    # Relaxed patterns to catch "5 ." or "5 " (common OCR artifacts)
-    regex_list = [
-        r"^\s*(?:Q|Question|Que|No|Problem)[\.\s\-]?\s*(\d+)", # Explicit: Q1, Question 1
-        r"^\s*(\d+)[\.\)\-\:]",                                 # Standard: 1. 1) 1-
-        r"^\s*(\d+)\s*[\.]?",                                   # Relaxed: 1 or 1 .
-        r"^(\d+)$"                                              # Standalone: 1
-    ]
-    BAD_KEYWORDS = ["Solution", "Detailed Solution", "Correct Answer", "Explanation", "Ans."]
-
-    valid_qs_coords = []
-    missing_qs = []
-    
-    # 1. FIND COORDINATES
-    for item in all_qs_targets:
-        p_idx = item['page']
-        q_target = item['val']
+    for p_idx, items in vision_map.items():
+        page_h = doc[p_idx].rect.height
         
-        page = doc[p_idx]
-        blocks = page.get_text("blocks")
-        
-        # Sort blocks by Y position (Top to Bottom) - Crucial for order
-        blocks.sort(key=lambda b: b[1])
-        
-        found = False
-        
-        for b in blocks:
-            text = b[4].strip()
-            if not text: continue
+        for item in items:
+            # Convert 0-1000 scale to actual PDF points
+            normalized_y = item['y']
+            actual_y = (normalized_y / 1000.0) * page_h
             
-            # Anti-Solution Guard
-            if any(bad in text for bad in BAD_KEYWORDS): continue
-            
-            # Check Text against Regex
-            for pat in regex_list:
-                m = re.search(pat, text, re.IGNORECASE)
-                if m:
-                    try:
-                        val = int(m.group(1))
-                        if val == q_target:
-                            valid_qs_coords.append({
-                                "label": str(val),
-                                "page": p_idx,
-                                "y0": b[1],
-                                "y1": b[3]
-                            })
-                            found = True
-                            break
-                    except: continue
-            if found: break
-        
-        if not found:
-            missing_qs.append(f"Q{q_target} (Pg {p_idx+1})")
+            all_qs_coords.append({
+                "label": str(item['q']),
+                "page": p_idx,
+                "y0": actual_y
+            })
 
-    # Log results of extraction
-    if missing_qs:
-        log_job(job_id, f"⚠️ Warning: AI found these but Regex missed them: {', '.join(missing_qs[:10])}...", "WARN")
+    # Sort: Primary by Page, Secondary by Y-position
+    all_qs_coords.sort(key=lambda x: (x["page"], x["y0"]))
     
-    if not valid_qs_coords:
-        log_job(job_id, "❌ Critical: AI found questions, but Regex could not locate ANY of them in text layer.", "ERROR")
+    log_job(job_id, f"✅ AI identified {len(all_qs_coords)} start points directly.", "INFO")
+    
+    if not all_qs_coords:
         return []
-
-    valid_qs_coords.sort(key=lambda x: (x["page"], x["y0"]))
-    log_job(job_id, f"✅ Successfully located start coordinates for {len(valid_qs_coords)} questions.", "INFO")
 
     # 2. CROP & STITCH
     final_output = []
     
-    for i, q in enumerate(valid_qs_coords):
+    for i, q in enumerate(all_qs_coords):
         curr_p = q["page"]
-        y_start = max(0, q["y0"] - 10)
         
-        # Determine Cut Point
-        if i + 1 < len(valid_qs_coords):
-            next_q = valid_qs_coords[i+1]
+        # Buffer: Start slightly above the AI's detected point to catch the top of the number
+        y_start = max(0, q["y0"] - 15)
+        
+        # Determine End Point (Cut Logic)
+        if i + 1 < len(all_qs_coords):
+            next_q = all_qs_coords[i+1]
             if next_q["page"] == curr_p:
-                y_end = next_q["y0"] - 15
+                # Next question is on the same page
+                # Cut slightly before the next question starts
+                y_end = max(y_start + 20, next_q["y0"] - 10)
             else:
-                y_end = doc[curr_p].rect.height - 50
+                # Next question is on a later page
+                # Take until bottom of current page
+                y_end = doc[curr_p].rect.height - 40 # Bottom margin buffer
         else:
-            y_end = doc[curr_p].rect.height - 50
+            # Last question of the whole doc
+            y_end = doc[curr_p].rect.height - 40
 
-        # Stitching Logic
+        # Stitching Logic (Handling Multi-Page Questions)
         pages_to_process = []
         
-        if i + 1 < len(valid_qs_coords) and valid_qs_coords[i+1]["page"] == curr_p:
+        # Scenario A: Single Page Segment
+        if i + 1 < len(all_qs_coords) and all_qs_coords[i+1]["page"] == curr_p:
              pages_to_process.append((curr_p, y_start, y_end))
-        elif i + 1 < len(valid_qs_coords) and valid_qs_coords[i+1]["page"] > curr_p:
+        
+        # Scenario B: Multi-Page Segment
+        elif i + 1 < len(all_qs_coords) and all_qs_coords[i+1]["page"] > curr_p:
+            # 1. Remainder of Current Page
             pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 40))
-            for gap_p in range(curr_p + 1, valid_qs_coords[i+1]["page"]):
+            
+            # 2. Full Intermediate Pages
+            for gap_p in range(curr_p + 1, all_qs_coords[i+1]["page"]):
                 pages_to_process.append((gap_p, 40, doc[gap_p].rect.height - 40))
-            next_p_idx = valid_qs_coords[i+1]["page"]
-            next_q_y = valid_qs_coords[i+1]["y0"] - 15
+            
+            # 3. Top of Next Page (until next Q starts)
+            next_p_idx = all_qs_coords[i+1]["page"]
+            next_q_y = all_qs_coords[i+1]["y0"] - 15
+            # Ensure we don't have negative height
+            next_q_y = max(50, next_q_y) 
             pages_to_process.append((next_p_idx, 40, next_q_y))
+            
+        # Scenario C: Very Last Question
         else:
-            pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 50))
+            pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 40))
 
+        # Render Images
         images = []
         total_h = 0
         max_w = 0
         
         for p_idx_s, y_s, y_e in pages_to_process:
-            if y_e <= y_s: continue
+            if y_e <= y_s: continue # Skip invalid segments
+            
             page = doc[p_idx_s]
             rect = fitz.Rect(0, y_s, page.rect.width, y_e)
+            
+            # High DPI for final output quality
             pix = page.get_pixmap(dpi=200, clip=rect)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            
             images.append(img)
             total_h += img.height
             max_w = max(max_w, img.width)
         
         if not images: continue
         
+        # Stitch
         final_img = Image.new('RGB', (max_w, total_h), (255, 255, 255))
         current_y = 0
         for img in images:
             final_img.paste(img, (0, current_y))
             current_y += img.height
         
+        # Save
         img_filename = f"Stark__--__{q['label']}__--__1.png"
         save_path = os.path.join(export_dir, img_filename)
         
@@ -344,31 +336,32 @@ def worker_process(job_id, pdf_path, job_dir):
         pdf_hash = get_pdf_hash(pdf_path)
         
         total_pages = len(doc)
-        FULL_PAGE_GUIDANCE = {}
+        FULL_VISION_DATA = {}
         BATCH_SIZE = 2
         
-        # PHASE 1: SCAN
+        # PHASE 1: VISION SCAN (Coordinates)
         for i in range(0, total_pages, BATCH_SIZE):
             batch_indices = range(i, min(i + BATCH_SIZE, total_pages))
-            log_job(job_id, f"🤖 Scanning Pages {[b+1 for b in batch_indices]}...", "INFO")
+            log_job(job_id, f"🤖 Vision Scanning Pages {[b+1 for b in batch_indices]}...", "INFO")
             
-            batch_data = get_questions_ai(job_id, doc, list(batch_indices))
+            # Now returns coordinates too!
+            batch_data = get_questions_ai_coordinates(job_id, doc, list(batch_indices))
             
             if batch_data:
                 for k, v in batch_data.items():
-                    FULL_PAGE_GUIDANCE[k] = v
-                    log_job(job_id, f"   -> Page {k+1}: Found Qs {v}", "INFO")
-            else:
-                log_job(job_id, f"   -> Page {i+1}: AI found no questions.", "INFO")
+                    FULL_VISION_DATA[k] = v
+                    # Log concise summary
+                    q_nums = [x['q'] for x in v]
+                    log_job(job_id, f"   -> Page {k+1}: Found Qs {q_nums}", "INFO")
             
             time.sleep(0.5)
 
-        # PHASE 2: PROCESS
-        log_job(job_id, "✂️ Processing & Stitching...", "INFO")
-        final_qs = extract_and_stitch(job_id, doc, FULL_PAGE_GUIDANCE, export_dir)
+        # PHASE 2: CROP (Pure Vision)
+        log_job(job_id, "✂️ Cropping based on Vision Coordinates...", "INFO")
+        final_qs = extract_and_stitch_pure_vision(job_id, doc, FULL_VISION_DATA, export_dir)
         
         if not final_qs:
-            raise Exception("No questions extracted (AI found them, but coordinate mapping failed).")
+            raise Exception("AI found no valid questions.")
             
         # PHASE 3: JSON & ZIP
         log_job(job_id, "📦 Generating Data Package...", "INFO")
@@ -377,7 +370,7 @@ def worker_process(job_id, pdf_path, job_dir):
             "testConfig": {"pdfFileHash": pdf_hash},
             "pdfCropperData": {"Stark": {"Stark": {}}},
             "appVersion": "1.30.0",
-            "generatedBy": "Team_Stark_V33_Fixed"
+            "generatedBy": "Team_Stark_Vision_Mode"
         }
         
         for q in final_qs:
@@ -463,7 +456,7 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Refined Regex & Logger) 🚀"
+    return "Team Stark V33 (Pure Vision Mode) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
