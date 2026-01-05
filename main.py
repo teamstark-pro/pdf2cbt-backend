@@ -11,17 +11,19 @@ import hashlib
 import random
 import re
 import gc
-import io
 import zipfile
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 import fitz  # PyMuPDF
 from PIL import Image
-from groq import Groq, InternalServerError, RateLimitError, APIError
+from groq import Groq, RateLimitError, BadRequestError
 
 # --- CONFIGURATION ---
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+# Allow CORS for all domains as requested
+CORS(app, resources={r"/*": {"origins": "*"}}, 
+     allow_headers=["*"], 
+     expose_headers=["Content-Disposition", "Content-Type"])
 
 # Directories
 BASE_TEMP_DIR = "/tmp/stark_processor"
@@ -35,57 +37,83 @@ logger = logging.getLogger(__name__)
 jobs = {}
 STARK_SECRET = os.environ.get("STARK_SECRET_KEY", "open_access_mode")
 
-# --- GROQ API MANAGER ---
-# Using the stable vision model. 'llama-4-scout' is often experimental/preview.
-# If you specifically need scout, change this back, but 11b-vision is very fast and stable.
-GROQ_MODEL = "llama-3.2-11b-vision-preview" 
+# --- MODEL CONFIGURATION ---
+# Updated to 90b as 11b was decommissioned. 
+# You can also try 'llama-3.2-11b-vision-preview' if it comes back, 
+# or check https://console.groq.com/docs/models for the latest list.
+CURRENT_VISION_MODEL = "llama-3.2-90b-vision-preview" 
 
-class GroqManager:
+# --- SMARTER GROQ MANAGER ---
+class SmartGroqManager:
     def __init__(self):
         raw_keys = os.environ.get("GROQ_API_KEYS", "")
-        self.api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-        if not self.api_keys:
+        self.all_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        # Dictionary to track when a key will be ready again (timestamp)
+        self.key_cooldowns = {k: 0 for k in self.all_keys}
+        
+        if not self.all_keys:
             logger.warning("⚠️ No GROQ_API_KEYS found in environment variables.")
 
     def get_client(self):
-        if not self.api_keys:
-            return None
-        # Pick random key to distribute load
-        return Groq(api_key=random.choice(self.api_keys))
+        if not self.all_keys:
+            return None, None
+        
+        now = time.time()
+        # Find keys that are not in cooldown
+        available_keys = [k for k in self.all_keys if now >= self.key_cooldowns[k]]
+        
+        if not available_keys:
+            # If all are in cooldown, pick the one that expires soonest
+            selected_key = min(self.key_cooldowns, key=self.key_cooldowns.get)
+            wait_time = max(0, self.key_cooldowns[selected_key] - now)
+            if wait_time > 0:
+                logger.info(f"⏳ All keys busy. Waiting {wait_time:.1f}s for key release...")
+                time.sleep(wait_time)
+        else:
+            selected_key = random.choice(available_keys)
+            
+        return Groq(api_key=selected_key), selected_key
 
-    def call_vision_batch(self, message_payload, retries=3):
-        """
-        Robust caller with exponential backoff and key rotation.
-        """
+    def mark_rate_limited(self, key):
+        """Put a key in penalty box for 20 seconds if it hits rate limit"""
+        self.key_cooldowns[key] = time.time() + 20
+        logger.warning(f"⚠️ Key ending in ...{key[-4:]} hit rate limit. Cooldown 20s.")
+
+    def call_vision_batch(self, message_payload, retries=5):
         for attempt in range(retries):
-            client = self.get_client()
-            if not client:
-                return None
+            client, key_used = self.get_client()
+            if not client: return None
 
             try:
                 completion = client.chat.completions.create(
-                    model=GROQ_MODEL,
+                    model=CURRENT_VISION_MODEL,
                     messages=[{"role": "user", "content": message_payload}],
                     temperature=0.1,
-                    max_tokens=2048,
+                    max_tokens=4096,
                     top_p=1,
                     stream=False,
                     response_format={"type": "json_object"}
                 )
-                content = completion.choices[0].message.content
-                return json.loads(content)
+                return json.loads(completion.choices[0].message.content)
 
             except RateLimitError:
-                wait_time = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(f"⚠️ Rate Limit hit. Retrying in {wait_time:.2f}s...")
-                time.sleep(wait_time)
+                self.mark_rate_limited(key_used)
+                time.sleep(1) # Short sleep before retry with new key
+            except BadRequestError as e:
+                # Handle model decommissioning specifically
+                if "decommissioned" in str(e).lower() or "model_decommissioned" in str(e).lower():
+                     logger.error(f"🔥 FATAL MODEL ERROR: {CURRENT_VISION_MODEL} is decommissioned. Update CURRENT_VISION_MODEL in app.py")
+                     # Break loop as retrying won't fix a decommissioned model
+                     break 
+                logger.error(f"❌ Bad Request: {str(e)}")
+                break
             except Exception as e:
-                logger.error(f"❌ Groq Error (Attempt {attempt+1}/{retries}): {str(e)}")
+                logger.error(f"❌ Groq Error: {str(e)}")
                 time.sleep(1)
         
         return None
 
-groq_manager = GroqManager()
+groq_manager = SmartGroqManager()
 
 # --- UTILS ---
 
@@ -101,315 +129,290 @@ def get_pdf_hash(path):
     return sha.hexdigest()
 
 def pixmap_to_base64(pix):
-    """Convert PyMuPDF Pixmap to base64 string completely in memory."""
+    """Convert PyMuPDF Pixmap to base64 string in memory"""
     try:
-        # Get PNG data from pixmap
         img_data = pix.tobytes("png")
         return base64.b64encode(img_data).decode('utf-8')
     except Exception as e:
-        logger.error(f"Image encoding error: {e}")
         return ""
 
 def log_job(job_id, msg):
     timestamp = time.strftime("%H:%M:%S")
     entry = f"[{timestamp}] {msg}"
-    print(f"[{job_id}] {msg}")  # Server console
+    print(f"[{job_id}] {msg}")
     if job_id in jobs:
         jobs[job_id]["logs"].append(entry)
 
 # --- CORE LOGIC ---
 
 def get_questions_ai(job_id, doc, page_indices):
-    """
-    Sends page images to Groq to find Question Numbers.
-    Optimization: Converts to base64 in memory, no disk writes.
-    """
     payload_content = [
         {
             "type": "text",
             "text": """
-            Analyze these exam page images. return a JSON object containing the Question Numbers found on each page.
+            Analyze these exam pages. Identify Question Numbers.
             
-            STRICT RULES:
-            1. Identify the start of every question block (e.g., "1.", "Q2", "Q.3", "4)", "Question 5").
-            2. IGNORE numbers inside "Solutions", "Answers", "Explanations", or page numbers.
-            3. Return format: { "page_index_0": [1, 2, 3], "page_index_1": [4, 5] }
-            4. Use the index provided in the image prompt as the key.
+            RULES:
+            1. Report EVERY question number you see starting a block (e.g., "1.", "Q2", "Q.3", "4)").
+            2. IGNORE numbers inside "Solution", "Answer", "Explanation" blocks.
+            3. IGNORE page numbers.
+            4. Output must be exhaustive.
+            
+            Return JSON: { "img_0": [1, 2, 3], "img_1": [4, 5] }
             """
         }
     ]
 
-    # Process images for this batch
-    valid_indices = []
+    valid_map = {} # Maps "img_X" to actual page index
     
-    for p_idx in page_indices:
+    for i, p_idx in enumerate(page_indices):
         try:
             page = doc[p_idx]
-            # Lower DPI for AI analysis is faster and cheaper (75-100 is enough for OCR)
-            pix = page.get_pixmap(dpi=100) 
-            b64_str = pixmap_to_base64(pix)
+            pix = page.get_pixmap(dpi=100)
+            b64 = pixmap_to_base64(pix)
+            key = f"img_{i}"
+            valid_map[key] = p_idx
             
-            if b64_str:
-                payload_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64_str}"}
-                })
-                # Add text label to help model map image to index
-                payload_content.append({
-                    "type": "text", 
-                    "text": f"Above image is page_index_{p_idx}"
-                })
-                valid_indices.append(p_idx)
-        except Exception as e:
-            log_job(job_id, f"⚠️ Error prepping page {p_idx}: {e}")
+            payload_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+            })
+        except: pass
 
-    if not valid_indices:
-        return None
+    if not valid_map: return None
 
-    log_job(job_id, f"🤖 Asking AI to analyze pages {valid_indices}...")
-    return groq_manager.call_vision_batch(payload_content)
+    response = groq_manager.call_vision_batch(payload_content)
+    
+    # Map back generic keys "img_0" to actual page indices
+    result_map = {}
+    if response:
+        for img_key, q_list in response.items():
+            if img_key in valid_map:
+                real_page_idx = valid_map[img_key]
+                clean_qs = [int(x) for x in q_list if str(x).isdigit()]
+                result_map[real_page_idx] = clean_qs
+                
+    return result_map
 
-def extract_and_stitch_robust(job_id, doc, question_map, export_dir):
-    """
-    Robust coordinate extraction and stitching.
-    """
-    # 1. Gather all targets
-    targets = []
-    for p_key, q_list in question_map.items():
-        # Handle keys like "page_index_1" or just "1"
-        try:
-            if "index_" in str(p_key):
-                p_idx = int(str(p_key).split("_")[-1])
-            else:
-                p_idx = int(p_key)
-            
-            for q in q_list:
-                targets.append({"page": p_idx, "q_num": int(q)})
-        except ValueError:
-            continue
+def extract_and_stitch(job_id, doc, page_map, export_dir):
+    # Flatten map
+    all_qs_targets = []
+    for p_idx, qs in page_map.items():
+        for q in qs:
+            all_qs_targets.append({"page": p_idx, "val": q})
+    
+    # Sort
+    all_qs_targets.sort(key=lambda x: (x["page"], x["val"]))
 
-    # Sort targets by page, then by number (assumption)
-    targets.sort(key=lambda x: (x['page'], x['q_num']))
-
-    # 2. Find Coordinates (Regex Search)
-    regex_patterns = [
-        r"^\s*(?:Q|Question|Que|No)[\.\s\-]?\s*(\d+)",  # Q.1, Q 1
-        r"^\s*(\d+)[\.\)\-\:]",                          # 1., 1)
-        r"^\s*(\d+)\s*$"                                 # 1 (Standalone)
+    # Regexes
+    regex_list = [
+        r"^\s*(?:Q|Question|Que|No)[\.\s\-]?\s*(\d+)",
+        r"^\s*(\d+)[\.\)\-\:]",
+        r"^\s*(\d+)\s*$"
     ]
-    ignore_keywords = ["Solution", "Answer", "Explanation", "Correct", "Ans"]
+    BAD_KEYWORDS = ["Solution", "Detailed Solution", "Correct Answer", "Explanation", "Ans."]
 
-    located_qs = []
-
-    for t in targets:
-        page = doc[t['page']]
+    valid_qs_coords = []
+    
+    # 1. FIND COORDINATES
+    for item in all_qs_targets:
+        p_idx = item['page']
+        q_target = item['val']
+        
+        page = doc[p_idx]
         blocks = page.get_text("blocks")
         found = False
         
         for b in blocks:
             text = b[4].strip()
             if not text: continue
+            if any(bad in text for bad in BAD_KEYWORDS): continue
             
-            # Anti-Solution Guard
-            if any(k.lower() in text.lower() for k in ignore_keywords): continue
-
-            for pat in regex_patterns:
+            for pat in regex_list:
                 m = re.search(pat, text, re.IGNORECASE)
                 if m:
                     try:
                         val = int(m.group(1))
-                        if val == t['q_num']:
-                            located_qs.append({
-                                "val": val,
-                                "page": t['page'],
-                                "y0": b[1], # Top
-                                "y1": b[3]  # Bottom
+                        if val == q_target:
+                            valid_qs_coords.append({
+                                "label": str(val),
+                                "page": p_idx,
+                                "y0": b[1],
+                                "y1": b[3]
                             })
                             found = True
                             break
-                    except: pass
+                    except: continue
             if found: break
-    
-    log_job(job_id, f"✅ Located coordinates for {len(located_qs)} questions.")
 
-    # 3. Stitching Logic
-    final_results = []
-    
-    # Sort located questions by position
-    located_qs.sort(key=lambda x: (x['page'], x['y0']))
+    valid_qs_coords.sort(key=lambda x: (x["page"], x["y0"]))
+    log_job(job_id, f"✅ Located {len(valid_qs_coords)} valid start points.")
 
-    for i, q in enumerate(located_qs):
-        try:
-            curr_p = q['page']
-            # Start slightly above the number
-            y_start = max(0, q['y0'] - 15) 
-            
-            # Determine End Point
-            if i + 1 < len(located_qs):
-                next_q = located_qs[i+1]
-                if next_q['page'] == curr_p:
-                    # Next Q is on same page, cut before it
-                    y_end = max(y_start + 50, next_q['y0'] - 20)
-                else:
-                    # Next Q is on later page
-                    y_end = doc[curr_p].rect.height - 40 # Bottom margin
+    # 2. CROP & STITCH
+    final_output = []
+    
+    for i, q in enumerate(valid_qs_coords):
+        curr_p = q["page"]
+        y_start = max(0, q["y0"] - 10)
+        
+        # Determine Cut Point
+        if i + 1 < len(valid_qs_coords):
+            next_q = valid_qs_coords[i+1]
+            if next_q["page"] == curr_p:
+                y_end = next_q["y0"] - 15
             else:
-                # Last question
-                y_end = doc[curr_p].rect.height - 40
+                y_end = doc[curr_p].rect.height - 50
+        else:
+            y_end = doc[curr_p].rect.height - 50
 
-            # Collect image segments
-            segments = []
+        # Stitching Logic
+        pages_to_process = []
+        
+        # Scenario A: Same Page
+        if i + 1 < len(valid_qs_coords) and valid_qs_coords[i+1]["page"] == curr_p:
+             pages_to_process.append((curr_p, y_start, y_end))
+        
+        # Scenario B: Multi Page
+        elif i + 1 < len(valid_qs_coords) and valid_qs_coords[i+1]["page"] > curr_p:
+            pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 40))
+            for gap_p in range(curr_p + 1, valid_qs_coords[i+1]["page"]):
+                pages_to_process.append((gap_p, 40, doc[gap_p].rect.height - 40))
             
-            # A. Current Page Segment
-            segments.append({"page": curr_p, "y1": y_start, "y2": y_end})
+            next_p_idx = valid_qs_coords[i+1]["page"]
+            next_q_y = valid_qs_coords[i+1]["y0"] - 15
+            pages_to_process.append((next_p_idx, 40, next_q_y))
+        
+        # Scenario C: Last Q
+        else:
+            pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 50))
 
-            # B. Multi-page logic (if next Q is on a later page)
-            if i + 1 < len(located_qs):
-                next_q = located_qs[i+1]
-                if next_q['page'] > curr_p:
-                    # Add full intermediate pages
-                    for gap_p in range(curr_p + 1, next_q['page']):
-                        h = doc[gap_p].rect.height
-                        segments.append({"page": gap_p, "y1": 40, "y2": h - 40})
-                    
-                    # Add top of next page until next Q starts
-                    next_h_end = max(50, next_q['y0'] - 20)
-                    segments.append({"page": next_q['page'], "y1": 40, "y2": next_h_end})
+        # Render
+        images = []
+        total_h = 0
+        max_w = 0
+        
+        for p_idx_s, y_s, y_e in pages_to_process:
+            if y_e <= y_s: continue
+            page = doc[p_idx_s]
+            rect = fitz.Rect(0, y_s, page.rect.width, y_e)
+            pix = page.get_pixmap(dpi=200, clip=rect)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            images.append(img)
+            total_h += img.height
+            max_w = max(max_w, img.width)
+        
+        if not images: continue
+        
+        final_img = Image.new('RGB', (max_w, total_h), (255, 255, 255))
+        current_y = 0
+        for img in images:
+            final_img.paste(img, (0, current_y))
+            current_y += img.height
+        
+        # --- CRITICAL: MAINTAIN EXACT FILE NAMING ---
+        img_filename = f"Stark__--__{q['label']}__--__1.png"
+        save_path = os.path.join(export_dir, img_filename)
+        
+        # Handle duplicates in same job
+        if os.path.exists(save_path):
+             img_filename = f"Stark__--__{q['label']}_{curr_p}__--__1.png"
+             save_path = os.path.join(export_dir, img_filename)
 
-            # Render and Stitch
-            pil_images = []
-            max_width = 0
-            total_height = 0
-
-            for seg in segments:
-                page = doc[seg['page']]
-                rect = fitz.Rect(0, seg['y1'], page.rect.width, seg['y2'])
-                # High DPI for final output
-                pix = page.get_pixmap(dpi=200, clip=rect) 
-                
-                # Convert to PIL
-                mode = "RGBA" if pix.alpha else "RGB"
-                img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
-                
-                pil_images.append(img)
-                max_width = max(max_width, img.width)
-                total_height += img.height
-
-            if not pil_images: continue
-
-            # Create Canvas
-            final_img = Image.new('RGB', (max_width, total_height), (255, 255, 255))
-            y_offset = 0
-            for img in pil_images:
-                # Center align if widths differ slightly? Or left align. Left is safer for text.
-                final_img.paste(img, (0, y_offset))
-                y_offset += img.height
-
-            # Save
-            filename = f"Q{q['val']}_{uuid.uuid4().hex[:4]}.png"
-            full_path = os.path.join(export_dir, filename)
-            final_img.save(full_path, "PNG", optimize=True)
-            
-            final_results.append({
-                "label": str(q['val']),
-                "filename": filename
-            })
-
-        except Exception as e:
-            log_job(job_id, f"⚠️ Error stitching Q{q.get('val', '?')}: {e}")
-
-    return final_results
+        final_img.save(save_path)
+        
+        final_output.append({
+            "label": q['label'],
+            "filename": img_filename
+        })
+        
+    return final_output
 
 def worker_process(job_id, pdf_path, job_dir):
-    """
-    Main Thread Worker. 
-    Running inside a specific directory per job to prevent race conditions.
-    """
-    export_dir = os.path.join(job_dir, "output")
+    # CRITICAL: Isolate output for concurrency
+    export_dir = os.path.join(job_dir, "master_package")
     os.makedirs(export_dir, exist_ok=True)
     
     try:
-        log_job(job_id, "🚀 Processing Started.")
-        
+        log_job(job_id, "🚀 Starting Process...")
         doc = fitz.open(pdf_path)
         pdf_hash = get_pdf_hash(pdf_path)
+        
         total_pages = len(doc)
+        FULL_PAGE_GUIDANCE = {}
+        BATCH_SIZE = 2
         
-        full_map = {}
-        BATCH_SIZE = 3 # Can increase if memory allows
-        
-        # Phase 1: AI Scan
+        # PHASE 1: SCAN
         for i in range(0, total_pages, BATCH_SIZE):
-            batch = list(range(i, min(i + BATCH_SIZE, total_pages)))
-            log_job(job_id, f"🔍 AI Scanning pages: {[b+1 for b in batch]}")
+            batch_indices = range(i, min(i + BATCH_SIZE, total_pages))
+            log_job(job_id, f"🤖 Scanning Pages {[b+1 for b in batch_indices]}...")
             
-            ai_data = get_questions_ai(job_id, doc, batch)
+            batch_data = get_questions_ai(job_id, doc, list(batch_indices))
             
-            if ai_data:
-                # Merge results
-                for key, val in ai_data.items():
-                    # clean key to get page index (handles "page_index_1" or "1")
-                    # clean val to ensure list of ints
-                    full_map[key] = val
+            if batch_data:
+                for k, v in batch_data.items():
+                    FULL_PAGE_GUIDANCE[k] = v
+                    log_job(job_id, f"   -> Page {k+1}: Found Qs {v}")
             
-            # Rate limit polite pause
             time.sleep(0.5)
 
-        log_job(job_id, f"💡 AI Found potential questions on {len(full_map)} pages.")
-
-        # Phase 2: Extraction
-        log_job(job_id, "✂️  Cropping and Stitching...")
-        final_qs = extract_and_stitch_robust(job_id, doc, full_map, export_dir)
-
+        # PHASE 2: PROCESS
+        log_job(job_id, "✂️ Processing & Stitching...")
+        final_qs = extract_and_stitch(job_id, doc, FULL_PAGE_GUIDANCE, export_dir)
+        
         if not final_qs:
-            raise Exception("No questions could be extracted/stitched.")
-
-        # Phase 3: JSON Generation
-        log_job(job_id, "📝 Generating Metadata...")
+            raise Exception("No questions extracted.")
+            
+        # PHASE 3: JSON & ZIP
+        log_job(job_id, "📦 Generating Data Package...")
+        
+        # --- CRITICAL: MAINTAIN EXACT JSON STRUCTURE ---
         data_json = {
             "testConfig": {"pdfFileHash": pdf_hash},
             "pdfCropperData": {"Stark": {"Stark": {}}},
             "appVersion": "1.30.0",
-            "meta": {"total_questions": len(final_qs)}
+            "generatedBy": "Team_Stark_V33_Fixed"
         }
+        
+        for q in final_qs:
+            key = q['label']
+            if "_" in q['filename']:
+                 try:
+                    # Try to parse original logic if complex filename
+                    key_part = q['filename'].split("__--__")[1]
+                    key = key_part
+                 except: pass
 
-        for item in final_qs:
-            key = item['label']
             data_json["pdfCropperData"]["Stark"]["Stark"][key] = {
                 "que": key,
                 "type": "mcq",
-                "file": item['filename'],
-                "processed_at": time.time()
+                "marks": {"cm": 4, "im": -1}, # Preserved logic
+                "answerOptions": "4",         # Preserved logic
+                "pdfData": [{                 # Preserved dummy logic
+                    "x1": 5, "x2": 995, "y1": 100, "y2": 500, "page": 1
+                }]
             }
-
+        
         with open(os.path.join(export_dir, "data.json"), "w") as f:
             json.dump(data_json, f, indent=2)
 
-        # Phase 4: Zipping
-        log_job(job_id, "📦 Zipping...")
-        zip_path = os.path.join(job_dir, f"Stark_Result_{job_id}.zip")
-        
+        zip_path = os.path.join(job_dir, f"{job_id}_result.zip")
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(export_dir):
                 for file in files:
                     zipf.write(os.path.join(root, file), file)
-
+        
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["file_path"] = zip_path
-        log_job(job_id, "✅ JOB COMPLETE.")
-
+        log_job(job_id, "✅ JOB COMPLETE. Downloading...")
+        
     except Exception as e:
-        logger.exception(f"Job {job_id} Failed")
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
-        log_job(job_id, f"🔥 FATAL: {str(e)}")
+        log_job(job_id, f"🔥 FATAL ERROR: {str(e)}")
     finally:
-        # Cleanup
         if 'doc' in locals(): doc.close()
-        # Clean up the output folder (unzipped images), keep the zip
         try:
-            shutil.rmtree(export_dir)
-            if os.path.exists(pdf_path): os.remove(pdf_path)
+            shutil.rmtree(export_dir) # Clean temp images
         except: pass
         gc.collect()
 
@@ -417,75 +420,45 @@ def worker_process(job_id, pdf_path, job_dir):
 
 @app.route('/upload', methods=['POST'])
 def start_job():
-    if not is_authorized(request):
-        return jsonify({"error": "Unauthorized"}), 403
+    if not is_authorized(request): return jsonify({"error": "Unauthorized"}), 403
+    if 'pdf' not in request.files: return jsonify({"error": "No file"}), 400
     
-    if 'pdf' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-        
     file = request.files['pdf']
-    if file.filename == '':
-        return jsonify({"error": "Empty filename"}), 400
-
     job_id = str(uuid.uuid4())[:8]
     
-    # Create isolated directory for this job
+    # CRITICAL: Unique directory per job
     job_dir = os.path.join(BASE_TEMP_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
     
-    pdf_path = os.path.join(job_dir, "source.pdf")
-    file.save(pdf_path)
-
-    jobs[job_id] = {
-        "status": "processing",
-        "logs": [],
-        "error": None,
-        "file_path": None,
-        "created_at": time.time()
-    }
-
-    # Start Worker
-    thread = threading.Thread(target=worker_process, args=(job_id, pdf_path, job_dir))
-    thread.daemon = True # Ensures thread dies if main app dies
+    save_path = os.path.join(job_dir, "source.pdf")
+    file.save(save_path)
+    
+    jobs[job_id] = {"status": "processing", "logs": [], "file_path": None, "error": None}
+    
+    thread = threading.Thread(target=worker_process, args=(job_id, save_path, job_dir))
+    thread.daemon = True
     thread.start()
-
-    return jsonify({
-        "job_id": job_id,
-        "message": "Processing started",
-        "status_url": f"/status/{job_id}"
-    })
+    
+    return jsonify({"job_id": job_id, "message": "Job started"})
 
 @app.route('/status/<job_id>', methods=['GET'])
 def get_status(job_id):
-    if job_id not in jobs:
-        return jsonify({"error": "Job not found"}), 404
-    
-    job = jobs[job_id]
+    if job_id not in jobs: return jsonify({"error": "Job not found"}), 404
     return jsonify({
-        "status": job["status"],
-        "logs": job["logs"][-20:], # Return last 20 logs to save bandwidth
-        "error": job["error"],
-        "download_ready": job["status"] == "completed"
+        "status": jobs[job_id]["status"],
+        "logs": jobs[job_id]["logs"],
+        "error": jobs[job_id]["error"]
     })
 
 @app.route('/download/<job_id>', methods=['GET'])
-def download(job_id):
-    if job_id not in jobs:
-        return jsonify({"error": "Job not found"}), 404
-    
-    job = jobs[job_id]
-    if job["status"] != "completed" or not job["file_path"]:
-        return jsonify({"error": "File not ready"}), 400
-        
-    return send_file(
-        job["file_path"], 
-        as_attachment=True, 
-        download_name=f"Stark_Export_{job_id}.zip"
-    )
+def download_result(job_id):
+    if job_id not in jobs or jobs[job_id]["status"] != "completed":
+        return jsonify({"error": "Not ready"}), 404
+    return send_file(jobs[job_id]["file_path"], as_attachment=True, download_name='Stark_Result.zip')
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({"status": "active", "jobs_in_mem": len(jobs)})
+@app.route('/')
+def home():
+    return "Team Stark V33 (Multi-User & Smart Switch) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
