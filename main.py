@@ -20,7 +20,6 @@ from groq import Groq, RateLimitError, BadRequestError
 
 # --- CONFIGURATION ---
 app = Flask(__name__)
-# Allow CORS for all domains as requested
 CORS(app, resources={r"/*": {"origins": "*"}}, 
      allow_headers=["*"], 
      expose_headers=["Content-Disposition", "Content-Type"])
@@ -29,16 +28,31 @@ CORS(app, resources={r"/*": {"origins": "*"}},
 BASE_TEMP_DIR = "/tmp/stark_processor"
 os.makedirs(BASE_TEMP_DIR, exist_ok=True)
 
-# Logging Setup
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# --- IMPROVED LOGGING FOR RAILWAY ---
+# Railway captures stdout. We format it clearly with the Job ID.
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("StarkLogger")
+
+def log_job(job_id, msg, level="INFO"):
+    """
+    Logs to both the internal memory (for frontend status) and stdout (for Railway).
+    Forces flush to ensure logs appear immediately in Railway.
+    """
+    timestamp = time.strftime("%H:%M:%S")
+    
+    # 1. Console Output (Railway)
+    # Format: [JOB_ID] [LEVEL] Message
+    print(f"[{job_id}] [{level}] {msg}", file=sys.stdout, flush=True)
+    
+    # 2. Memory Output (Frontend)
+    if job_id in jobs:
+        jobs[job_id]["logs"].append(f"[{timestamp}] {msg}")
 
 # --- GLOBAL STATE ---
 jobs = {}
 STARK_SECRET = os.environ.get("STARK_SECRET_KEY", "open_access_mode")
 
 # --- MODEL CONFIGURATION ---
-# Updated to the specific model requested by user
 CURRENT_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # --- SMARTER GROQ MANAGER ---
@@ -46,26 +60,23 @@ class SmartGroqManager:
     def __init__(self):
         raw_keys = os.environ.get("GROQ_API_KEYS", "")
         self.all_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-        # Dictionary to track when a key will be ready again (timestamp)
         self.key_cooldowns = {k: 0 for k in self.all_keys}
         
         if not self.all_keys:
-            logger.warning("⚠️ No GROQ_API_KEYS found in environment variables.")
+            log_job("SYSTEM", "⚠️ No GROQ_API_KEYS found!", "WARN")
 
     def get_client(self):
         if not self.all_keys:
             return None, None
         
         now = time.time()
-        # Find keys that are not in cooldown
         available_keys = [k for k in self.all_keys if now >= self.key_cooldowns[k]]
         
         if not available_keys:
-            # If all are in cooldown, pick the one that expires soonest
             selected_key = min(self.key_cooldowns, key=self.key_cooldowns.get)
             wait_time = max(0, self.key_cooldowns[selected_key] - now)
             if wait_time > 0:
-                logger.info(f"⏳ All keys busy. Waiting {wait_time:.1f}s for key release...")
+                print(f"[SYSTEM] ⏳ Keys busy. Sleeping {wait_time:.1f}s...", flush=True)
                 time.sleep(wait_time)
         else:
             selected_key = random.choice(available_keys)
@@ -73,9 +84,8 @@ class SmartGroqManager:
         return Groq(api_key=selected_key), selected_key
 
     def mark_rate_limited(self, key):
-        """Put a key in penalty box for 20 seconds if it hits rate limit"""
         self.key_cooldowns[key] = time.time() + 20
-        logger.warning(f"⚠️ Key ending in ...{key[-4:]} hit rate limit. Cooldown 20s.")
+        print(f"[SYSTEM] ⚠️ Rate limit on key ...{key[-4:]}. Cooldown 20s.", flush=True)
 
     def call_vision_batch(self, message_payload, retries=5):
         for attempt in range(retries):
@@ -96,20 +106,16 @@ class SmartGroqManager:
 
             except RateLimitError:
                 self.mark_rate_limited(key_used)
-                time.sleep(1) # Short sleep before retry with new key
+                time.sleep(1)
             except BadRequestError as e:
-                # Handle model decommissioning specifically
-                if "decommissioned" in str(e).lower() or "model_decommissioned" in str(e).lower():
-                     logger.error(f"🔥 FATAL MODEL ERROR: {CURRENT_VISION_MODEL} is decommissioned. Update CURRENT_VISION_MODEL in app.py")
-                     # Break loop as retrying won't fix a decommissioned model
+                if "decommissioned" in str(e).lower():
+                     log_job("SYSTEM", f"🔥 FATAL: Model {CURRENT_VISION_MODEL} decommissioned.", "ERROR")
                      break 
-                logger.error(f"❌ Bad Request: {str(e)}")
-                # If image is too large (413), we might want to catch that, but generic logging covers it.
+                log_job("SYSTEM", f"❌ Bad Request: {str(e)}", "ERROR")
                 break
             except Exception as e:
-                logger.error(f"❌ Groq Error: {str(e)}")
+                log_job("SYSTEM", f"❌ Groq Error: {str(e)}", "ERROR")
                 time.sleep(1)
-        
         return None
 
 groq_manager = SmartGroqManager()
@@ -128,26 +134,13 @@ def get_pdf_hash(path):
     return sha.hexdigest()
 
 def pixmap_to_base64(pix):
-    """Convert PyMuPDF Pixmap to base64 string in memory"""
     try:
-        # Optimization: Use JPEG instead of PNG.
-        # The new models have a strict 4MB base64 limit. 
-        # PNGs often exceed this. JPEGs are much safer.
         if pix.alpha:
             pix = fitz.Pixmap(fitz.csRGB, pix)
-        
         img_data = pix.tobytes("jpeg", jpg_quality=85)
         return base64.b64encode(img_data).decode('utf-8')
     except Exception as e:
-        logger.error(f"Image encoding error: {e}")
         return ""
-
-def log_job(job_id, msg):
-    timestamp = time.strftime("%H:%M:%S")
-    entry = f"[{timestamp}] {msg}"
-    print(f"[{job_id}] {msg}")
-    if job_id in jobs:
-        jobs[job_id]["logs"].append(entry)
 
 # --- CORE LOGIC ---
 
@@ -157,32 +150,25 @@ def get_questions_ai(job_id, doc, page_indices):
             "type": "text",
             "text": """
             Analyze these exam pages. Identify Question Numbers.
-            
             RULES:
             1. Report EVERY question number you see starting a block (e.g., "1.", "Q2", "Q.3", "4)").
-            2. IGNORE numbers inside "Solution", "Answer", "Explanation" blocks.
-            3. IGNORE page numbers.
-            4. Output must be exhaustive.
-            
-            Return JSON: { "img_0": [1, 2, 3], "img_1": [4, 5] }
+            2. IGNORE numbers inside "Solution", "Answer" blocks.
+            3. Return JSON: { "img_0": [1, 2, 3], "img_1": [4, 5] }
             """
         }
     ]
 
-    valid_map = {} # Maps "img_X" to actual page index
+    valid_map = {}
     
     for i, p_idx in enumerate(page_indices):
         try:
             page = doc[p_idx]
-            # 100 DPI is sufficient for AI reading and keeps size low
             pix = page.get_pixmap(dpi=100)
             b64 = pixmap_to_base64(pix)
-            
             if not b64: continue
 
             key = f"img_{i}"
             valid_map[key] = p_idx
-            
             payload_content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
@@ -193,12 +179,12 @@ def get_questions_ai(job_id, doc, page_indices):
 
     response = groq_manager.call_vision_batch(payload_content)
     
-    # Map back generic keys "img_0" to actual page indices
     result_map = {}
     if response:
         for img_key, q_list in response.items():
             if img_key in valid_map:
                 real_page_idx = valid_map[img_key]
+                # Filter strictly for integers
                 clean_qs = [int(x) for x in q_list if str(x).isdigit()]
                 result_map[real_page_idx] = clean_qs
                 
@@ -211,18 +197,20 @@ def extract_and_stitch(job_id, doc, page_map, export_dir):
         for q in qs:
             all_qs_targets.append({"page": p_idx, "val": q})
     
-    # Sort
     all_qs_targets.sort(key=lambda x: (x["page"], x["val"]))
 
-    # Regexes
+    # --- IMPROVED REGEX ---
+    # Relaxed patterns to catch "5 ." or "5 " (common OCR artifacts)
     regex_list = [
-        r"^\s*(?:Q|Question|Que|No)[\.\s\-]?\s*(\d+)",
-        r"^\s*(\d+)[\.\)\-\:]",
-        r"^\s*(\d+)\s*$"
+        r"^\s*(?:Q|Question|Que|No|Problem)[\.\s\-]?\s*(\d+)", # Explicit: Q1, Question 1
+        r"^\s*(\d+)[\.\)\-\:]",                                 # Standard: 1. 1) 1-
+        r"^\s*(\d+)\s*[\.]?",                                   # Relaxed: 1 or 1 .
+        r"^(\d+)$"                                              # Standalone: 1
     ]
     BAD_KEYWORDS = ["Solution", "Detailed Solution", "Correct Answer", "Explanation", "Ans."]
 
     valid_qs_coords = []
+    missing_qs = []
     
     # 1. FIND COORDINATES
     for item in all_qs_targets:
@@ -231,13 +219,20 @@ def extract_and_stitch(job_id, doc, page_map, export_dir):
         
         page = doc[p_idx]
         blocks = page.get_text("blocks")
+        
+        # Sort blocks by Y position (Top to Bottom) - Crucial for order
+        blocks.sort(key=lambda b: b[1])
+        
         found = False
         
         for b in blocks:
             text = b[4].strip()
             if not text: continue
+            
+            # Anti-Solution Guard
             if any(bad in text for bad in BAD_KEYWORDS): continue
             
+            # Check Text against Regex
             for pat in regex_list:
                 m = re.search(pat, text, re.IGNORECASE)
                 if m:
@@ -254,9 +249,20 @@ def extract_and_stitch(job_id, doc, page_map, export_dir):
                             break
                     except: continue
             if found: break
+        
+        if not found:
+            missing_qs.append(f"Q{q_target} (Pg {p_idx+1})")
+
+    # Log results of extraction
+    if missing_qs:
+        log_job(job_id, f"⚠️ Warning: AI found these but Regex missed them: {', '.join(missing_qs[:10])}...", "WARN")
+    
+    if not valid_qs_coords:
+        log_job(job_id, "❌ Critical: AI found questions, but Regex could not locate ANY of them in text layer.", "ERROR")
+        return []
 
     valid_qs_coords.sort(key=lambda x: (x["page"], x["y0"]))
-    log_job(job_id, f"✅ Located {len(valid_qs_coords)} valid start points.")
+    log_job(job_id, f"✅ Successfully located start coordinates for {len(valid_qs_coords)} questions.", "INFO")
 
     # 2. CROP & STITCH
     final_output = []
@@ -278,25 +284,18 @@ def extract_and_stitch(job_id, doc, page_map, export_dir):
         # Stitching Logic
         pages_to_process = []
         
-        # Scenario A: Same Page
         if i + 1 < len(valid_qs_coords) and valid_qs_coords[i+1]["page"] == curr_p:
              pages_to_process.append((curr_p, y_start, y_end))
-        
-        # Scenario B: Multi Page
         elif i + 1 < len(valid_qs_coords) and valid_qs_coords[i+1]["page"] > curr_p:
             pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 40))
             for gap_p in range(curr_p + 1, valid_qs_coords[i+1]["page"]):
                 pages_to_process.append((gap_p, 40, doc[gap_p].rect.height - 40))
-            
             next_p_idx = valid_qs_coords[i+1]["page"]
             next_q_y = valid_qs_coords[i+1]["y0"] - 15
             pages_to_process.append((next_p_idx, 40, next_q_y))
-        
-        # Scenario C: Last Q
         else:
             pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 50))
 
-        # Render
         images = []
         total_h = 0
         max_w = 0
@@ -319,11 +318,9 @@ def extract_and_stitch(job_id, doc, page_map, export_dir):
             final_img.paste(img, (0, current_y))
             current_y += img.height
         
-        # --- CRITICAL: MAINTAIN EXACT FILE NAMING ---
         img_filename = f"Stark__--__{q['label']}__--__1.png"
         save_path = os.path.join(export_dir, img_filename)
         
-        # Handle duplicates in same job
         if os.path.exists(save_path):
              img_filename = f"Stark__--__{q['label']}_{curr_p}__--__1.png"
              save_path = os.path.join(export_dir, img_filename)
@@ -338,12 +335,11 @@ def extract_and_stitch(job_id, doc, page_map, export_dir):
     return final_output
 
 def worker_process(job_id, pdf_path, job_dir):
-    # CRITICAL: Isolate output for concurrency
     export_dir = os.path.join(job_dir, "master_package")
     os.makedirs(export_dir, exist_ok=True)
     
     try:
-        log_job(job_id, "🚀 Starting Process...")
+        log_job(job_id, "🚀 Starting Process...", "INFO")
         doc = fitz.open(pdf_path)
         pdf_hash = get_pdf_hash(pdf_path)
         
@@ -354,28 +350,29 @@ def worker_process(job_id, pdf_path, job_dir):
         # PHASE 1: SCAN
         for i in range(0, total_pages, BATCH_SIZE):
             batch_indices = range(i, min(i + BATCH_SIZE, total_pages))
-            log_job(job_id, f"🤖 Scanning Pages {[b+1 for b in batch_indices]}...")
+            log_job(job_id, f"🤖 Scanning Pages {[b+1 for b in batch_indices]}...", "INFO")
             
             batch_data = get_questions_ai(job_id, doc, list(batch_indices))
             
             if batch_data:
                 for k, v in batch_data.items():
                     FULL_PAGE_GUIDANCE[k] = v
-                    log_job(job_id, f"   -> Page {k+1}: Found Qs {v}")
+                    log_job(job_id, f"   -> Page {k+1}: Found Qs {v}", "INFO")
+            else:
+                log_job(job_id, f"   -> Page {i+1}: AI found no questions.", "INFO")
             
             time.sleep(0.5)
 
         # PHASE 2: PROCESS
-        log_job(job_id, "✂️ Processing & Stitching...")
+        log_job(job_id, "✂️ Processing & Stitching...", "INFO")
         final_qs = extract_and_stitch(job_id, doc, FULL_PAGE_GUIDANCE, export_dir)
         
         if not final_qs:
-            raise Exception("No questions extracted.")
+            raise Exception("No questions extracted (AI found them, but coordinate mapping failed).")
             
         # PHASE 3: JSON & ZIP
-        log_job(job_id, "📦 Generating Data Package...")
+        log_job(job_id, "📦 Generating Data Package...", "INFO")
         
-        # --- CRITICAL: MAINTAIN EXACT JSON STRUCTURE ---
         data_json = {
             "testConfig": {"pdfFileHash": pdf_hash},
             "pdfCropperData": {"Stark": {"Stark": {}}},
@@ -387,7 +384,6 @@ def worker_process(job_id, pdf_path, job_dir):
             key = q['label']
             if "_" in q['filename']:
                  try:
-                    # Try to parse original logic if complex filename
                     key_part = q['filename'].split("__--__")[1]
                     key = key_part
                  except: pass
@@ -395,9 +391,9 @@ def worker_process(job_id, pdf_path, job_dir):
             data_json["pdfCropperData"]["Stark"]["Stark"][key] = {
                 "que": key,
                 "type": "mcq",
-                "marks": {"cm": 4, "im": -1}, # Preserved logic
-                "answerOptions": "4",         # Preserved logic
-                "pdfData": [{                 # Preserved dummy logic
+                "marks": {"cm": 4, "im": -1},
+                "answerOptions": "4",
+                "pdfData": [{
                     "x1": 5, "x2": 995, "y1": 100, "y2": 500, "page": 1
                 }]
             }
@@ -413,16 +409,16 @@ def worker_process(job_id, pdf_path, job_dir):
         
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["file_path"] = zip_path
-        log_job(job_id, "✅ JOB COMPLETE. Downloading...")
+        log_job(job_id, "✅ JOB COMPLETE. Ready for download.", "SUCCESS")
         
     except Exception as e:
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
-        log_job(job_id, f"🔥 FATAL ERROR: {str(e)}")
+        log_job(job_id, f"🔥 FATAL ERROR: {str(e)}", "ERROR")
     finally:
         if 'doc' in locals(): doc.close()
         try:
-            shutil.rmtree(export_dir) # Clean temp images
+            shutil.rmtree(export_dir)
         except: pass
         gc.collect()
 
@@ -436,7 +432,6 @@ def start_job():
     file = request.files['pdf']
     job_id = str(uuid.uuid4())[:8]
     
-    # CRITICAL: Unique directory per job
     job_dir = os.path.join(BASE_TEMP_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
     
@@ -468,7 +463,7 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Multi-User & Smart Switch) 🚀"
+    return "Team Stark V33 (Refined Regex & Logger) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
