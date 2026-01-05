@@ -20,7 +20,7 @@ from groq import Groq
 
 app = Flask(__name__)
 
-# --- 🔥 CORS & SECURITY 🔥 ---
+# --- 🔥 CORS & CONFIG 🔥 ---
 CORS(app, resources={r"/*": {"origins": "*"}}, 
      methods=["GET", "POST", "OPTIONS"],
      allow_headers=["*"],
@@ -30,23 +30,23 @@ EXPORT_DIR = "/tmp/cbt_master_package"
 UPLOAD_FOLDER = "/tmp/uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# Global Job Store
 jobs = {}
 
-# --- 🔐 SECURITY CHECK ---
+# --- 🔐 SECURITY ---
 STARK_SECRET = os.environ.get("STARK_SECRET_KEY", "open_access_mode")
 def is_authorized(req):
     if STARK_SECRET == "open_access_mode": return True
     client_key = req.headers.get("x-stark-secret")
     return client_key == STARK_SECRET
 
-# --- ⚡ MULTI-KEY GROQ CLIENT ---
+# --- ⚡ GROQ CLIENT ---
 RAW_KEYS = os.environ.get("GROQ_API_KEYS", "")
 API_KEY_POOL = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
 
 def get_groq_client():
     if not API_KEY_POOL: return None
-    selected_key = random.choice(API_KEY_POOL)
-    return Groq(api_key=selected_key)
+    return Groq(api_key=random.choice(API_KEY_POOL))
 
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
@@ -62,7 +62,7 @@ def job_log(job_id, msg):
         timestamp = time.strftime("%H:%M:%S")
         jobs[job_id]["logs"].append(f"[{timestamp}] {msg}")
 
-# --- 🤖 GROQ BATCH PROCESSOR ---
+# --- 🤖 GROQ SCANNER ---
 def get_questions_batch(job_id, image_paths):
     client = get_groq_client()
     if not client: return None
@@ -74,15 +74,23 @@ def get_questions_batch(job_id, image_paths):
             {
                 "type": "text",
                 "text": """
-                Analyze these exam pages. Identify Question Numbers.
+                You are a Question Detection System. Scan these exam pages.
                 
-                RULES:
-                1. Report EVERY question number you see starting a block (e.g., "1.", "Q2", "Q.3", "4)").
-                2. IGNORE numbers inside "Solution", "Answer", "Explanation" blocks.
-                3. IGNORE page numbers.
-                4. Output must be exhaustive.
+                MISSION:
+                Identify every single Question Number that starts a question block.
                 
-                Return JSON: { "img_0": [1, 2, 3], "img_1": [4, 5] }
+                PATTERNS TO CATCH:
+                - Standard: "1.", "Q1", "Q.1", "Q-1"
+                - Brackets: "(1)", "1)"
+                - Standalone: "1" (if it looks like a label)
+                
+                STRICT EXCLUSIONS:
+                - DO NOT include numbers inside "Solution", "Ans", "Hint", "Explanation".
+                - DO NOT include Page Numbers.
+                
+                OUTPUT:
+                Return JSON mapping image index to a LIST of INTEGERS.
+                Example: { "img_0": [1, 2, 3], "img_1": [4, 5] }
                 """
             }
         ]
@@ -99,7 +107,7 @@ def get_questions_batch(job_id, image_paths):
         completion = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[{"role": "user", "content": message_content}],
-            temperature=0.1, max_tokens=1000, top_p=1, stream=False,
+            temperature=0.1, max_tokens=800, top_p=1, stream=False,
             response_format={"type": "json_object"}
         )
         
@@ -109,33 +117,36 @@ def get_questions_batch(job_id, image_paths):
         job_log(job_id, f"❌ Groq Error: {str(e)}")
         return None
 
-# --- ✂️ EXTRACTOR & STITCHER ---
-def extract_and_stitch(job_id, doc, page_map):
-    # Flatten map to a list: [(page, q_num), ...]
-    all_qs_targets = []
+# --- ✂️ PROCESSOR ---
+def extract_questions(job_id, doc, page_map):
+    # Flatten map -> [(page, number)]
+    all_targets = []
     for p, qs in page_map.items():
         for q in qs:
-            all_qs_targets.append({"page": p, "val": q})
+            all_targets.append({"page": p, "val": q})
     
-    # Regexes (Expanded)
+    # Regexes (Broad to Narrow)
+    # 1. Explicit labels (Q.1, Q1)
+    # 2. Start of line numbers (1., 1))
+    # 3. Standalone numbers
     regex_list = [
-        r"^\s*(?:Q|Question|Que|No)[\.\s\-]?\s*(\d+)", # Q.1, Q1
-        r"^\s*(\d+)[\.\)\-\:]", # 1., 1)
-        r"^\s*(\d+)\s*$" # 1 (Standalone)
+        r"^\s*(?:Q|Question|Que|No)[\.\s\-]?\s*(\d+)", 
+        r"^\s*(\d+)[\.\)\-\:]", 
+        r"^\s*(\d+)\s*$" 
     ]
-    BAD_KEYWORDS = ["Solution", "Detailed Solution", "Correct Answer", "Explanation", "Ans."]
-
-    valid_qs_coords = []
     
-    # 1. FIND COORDINATES
-    for item in all_qs_targets:
+    BAD_KEYWORDS = ["Solution", "Detailed Solution", "Correct Answer", "Explanation", "Ans."]
+    
+    valid_coords = []
+    
+    # 1. FIND LOCATIONS
+    for item in all_targets:
         p_idx = item['page']
         q_target = item['val']
-        
         page = doc[p_idx]
         blocks = page.get_text("blocks")
-        found = False
         
+        found = False
         for b in blocks:
             text = b[4].strip()
             if not text: continue
@@ -149,261 +160,201 @@ def extract_and_stitch(job_id, doc, page_map):
                 if m:
                     try:
                         val = int(m.group(1))
-                        # Match Groq's target number
                         if val == q_target:
-                            valid_qs_coords.append({
+                            valid_coords.append({
                                 "label": str(val),
                                 "page": p_idx,
-                                "y0": b[1], # Top of block
-                                "y1": b[3]  # Bottom of block
+                                "y0": b[1],
+                                "y1": b[3]
                             })
                             found = True
                             break
                     except: continue
             if found: break
     
-    # 🔥 CRITICAL FIX: Sort by (Page, Y-Pos) instead of Question Number
-    # This keeps Q1(Physics), Q2(Physics)... Q1(Chem) in correct reading order
-    valid_qs_coords.sort(key=lambda x: (x["page"], x["y0"]))
+    # Sort Spatially: Page -> Y Position
+    valid_coords.sort(key=lambda x: (x["page"], x["y0"]))
+    job_log(job_id, f"✅ Verified {len(valid_coords)} locations via OCR match.")
     
-    job_log(job_id, f"✅ Located {len(valid_qs_coords)} valid start points (Sorted Spatially).")
-
-    # 2. CROP & STITCH
-    final_output = []
+    # 2. CROP & GENERATE JSON DATA
+    final_json_data = {}
     
-    for i, q in enumerate(valid_qs_coords):
+    for i, q in enumerate(valid_coords):
         curr_p = q["page"]
-        y_start = max(0, q["y0"] - 10) # Little buffer above
         
-        # Determine Cut Point (Next Q or End of Page)
-        if i + 1 < len(valid_qs_coords):
-            next_q = valid_qs_coords[i+1]
-            next_p = next_q["page"]
-            
-            # If next Q is on same page, cut there
-            if next_p == curr_p:
+        # Calculate Crop Box
+        # Start: slightly above found label
+        y_start = max(0, q["y0"] - 10)
+        
+        # End: find next question or end of page
+        pg_h = doc[curr_p].rect.height
+        pg_w = doc[curr_p].rect.width
+        
+        if i + 1 < len(valid_coords):
+            next_q = valid_coords[i+1]
+            if next_q["page"] == curr_p:
                 y_end = next_q["y0"] - 15
-            # If next Q is far away, take full page
             else:
-                y_end = doc[curr_p].rect.height - 50
+                y_end = pg_h - 50 # End of current page
         else:
-            # Last question
-            y_end = doc[curr_p].rect.height - 50
+            y_end = pg_h - 50 # Last question
+            
+        # Ensure min height
+        if y_end <= y_start: y_end = y_start + 100
+        
+        # --- CROP IMAGE ---
+        page = doc[curr_p]
+        pix = page.get_pixmap(dpi=200)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        
+        scale_w = pix.width / pg_w
+        scale_h = pix.height / pg_h
+        
+        # Full width crop (0 to pg_w)
+        crop_box = (0, y_start * scale_h, pg_w * scale_w, y_end * scale_h)
+        
+        try:
+            cropped = img.crop(crop_box)
+            img_name = f"Stark__--__{q['label']}__--__1.png"
+            
+            # Handle duplicates (e.g. Q1 in Section A, Q1 in Section B)
+            if os.path.exists(os.path.join(EXPORT_DIR, img_name)):
+                 img_name = f"Stark__--__{q['label']}_p{curr_p}__--__1.png"
+            
+            cropped.save(os.path.join(EXPORT_DIR, img_name))
+            
+            # --- JSON ENTRY (FIXED STRUCTURE) ---
+            # Using str(q['label']) as key.
+            # If duplicate, we use unique key but keep "que" label same
+            unique_key = q['label']
+            if "_" in img_name and "_p" in img_name:
+                unique_key = f"{q['label']}_{curr_p}"
 
-        # STITCHING LOGIC
-        pages_to_process = []
-        
-        # Scenario A: Standard (Single Page)
-        if i + 1 < len(valid_qs_coords) and valid_qs_coords[i+1]["page"] == curr_p:
-             pages_to_process.append((curr_p, y_start, y_end))
-             
-        # Scenario B: Split Question (Next Q is on Next Page)
-        # We assume the question continues until the next question starts
-        elif i + 1 < len(valid_qs_coords) and valid_qs_coords[i+1]["page"] > curr_p:
-            # Current Page: Start -> Bottom
-            pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 40))
+            final_json_data[unique_key] = {
+                "que": q['label'],
+                "type": "mcq",
+                "marks": {"cm": 4, "im": -1},
+                "pdfData": [{
+                    "x1": 5, 
+                    "x2": 995, 
+                    "y1": round((y_start/pg_h)*1000), 
+                    "y2": round((y_end/pg_h)*1000), 
+                    "page": curr_p + 1 # 1-based index
+                }],
+                "answerOptions": "4"
+            }
             
-            # Intermediate Pages (Full) - if any
-            for gap_p in range(curr_p + 1, valid_qs_coords[i+1]["page"]):
-                pages_to_process.append((gap_p, 40, doc[gap_p].rect.height - 40))
-                
-            # Next Page: Top -> Next Q Start
-            next_p_idx = valid_qs_coords[i+1]["page"]
-            next_q_y = valid_qs_coords[i+1]["y0"] - 15
-            pages_to_process.append((next_p_idx, 40, next_q_y)) # Start from 40 (Header buffer)
+        except Exception as e:
+            job_log(job_id, f"⚠️ Crop failed for Q{q['label']}: {e}")
             
-            job_log(job_id, f"🧵 Stitching Q{q['label']} across {len(pages_to_process)} segments")
-            
-        else:
-            # Last question on page
-            pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 50))
+    return final_json_data
 
-        # RENDER IMAGES
-        images = []
-        total_h = 0
-        max_w = 0
-        
-        for p_idx, y_s, y_e in pages_to_process:
-            # Safety check
-            if y_e <= y_s: continue
-            
-            page = doc[p_idx]
-            pix = page.get_pixmap(dpi=200)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            
-            pg_w = page.rect.width
-            pg_h = page.rect.height
-            scale_w = pix.width / pg_w
-            scale_h = pix.height / pg_h
-            
-            crop_box = (0, y_s * scale_h, pg_w * scale_w, y_e * scale_h)
-            try:
-                cropped = img.crop(crop_box)
-                images.append(cropped)
-                total_h += cropped.height
-                max_w = max(max_w, cropped.width)
-            except: pass
-        
-        if not images: continue
-        
-        # Merge
-        if len(images) == 1:
-            final_img = images[0]
-        else:
-            final_img = Image.new('RGB', (max_w, total_h), (255, 255, 255))
-            current_y = 0
-            for img in images:
-                final_img.paste(img, (0, current_y))
-                current_y += img.height
-        
-        # Save
-        # Stark Format: Section__--__Label__--__1.png
-        # We make label unique to avoid overwriting Q1 (Physics) with Q1 (Chem)
-        # By appending page number if needed, but standard format is simpler.
-        # Let's trust user to have unique numbering or handle duplicates in frontend.
-        # Just in case, if label exists, append _1
-        
-        img_filename = f"Stark__--__{q['label']}__--__1.png"
-        save_path = os.path.join(EXPORT_DIR, img_filename)
-        
-        # Overwrite protection
-        if os.path.exists(save_path):
-             img_filename = f"Stark__--__{q['label']}_{curr_p}__--__1.png"
-             save_path = os.path.join(EXPORT_DIR, img_filename)
-
-        final_img.save(save_path)
-        
-        final_output.append({
-            "label": q['label'],
-            "filename": img_filename
-        })
-        
-    return final_output
-
-# --- 🧵 BACKGROUND WORKER ---
-def process_pdf_thread(job_id, pdf_path):
+# --- 🧵 WORKER THREAD ---
+def process_thread(job_id, pdf_path):
     try:
-        job_log(job_id, "🚀 Starting Process...")
-        
+        job_log(job_id, "🚀 Initialization...")
         if os.path.exists(EXPORT_DIR): shutil.rmtree(EXPORT_DIR)
         os.makedirs(EXPORT_DIR, exist_ok=True)
         
         doc = fitz.open(pdf_path)
-        pdf_hash = get_pdf_hash(pdf_path) # Hash is Back!
+        pdf_hash = get_pdf_hash(pdf_path) # Hash for JSON
         
-        total_pages = len(doc)
-        FULL_PAGE_GUIDANCE = {}
+        FULL_MAP = {}
         BATCH_SIZE = 2
         
         # PHASE 1: SCAN
-        for i in range(0, total_pages, BATCH_SIZE):
-            batch_indices = range(i, min(i + BATCH_SIZE, total_pages))
+        for i in range(0, len(doc), BATCH_SIZE):
+            indices = range(i, min(i + BATCH_SIZE, len(doc)))
             img_paths = []
             
-            job_log(job_id, f"🤖 Scanning Pages {[b+1 for b in batch_indices]}...")
-            for p_idx in batch_indices:
-                pix = doc[p_idx].get_pixmap(dpi=100)
-                path = os.path.join(UPLOAD_FOLDER, f"{job_id}_batch_{p_idx}.jpg")
-                pix.save(path)
-                img_paths.append(path)
+            job_log(job_id, f"🤖 Scanning Pages {[x+1 for x in indices]}...")
+            for p in indices:
+                pix = doc[p].get_pixmap(dpi=100)
+                p_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_{p}.jpg")
+                pix.save(p_path)
+                img_paths.append(p_path)
             
-            batch_data = get_questions_batch(job_id, img_paths)
+            res = get_questions_batch(job_id, img_paths)
+            if res:
+                for idx, key in enumerate(sorted(res.keys())):
+                    if idx < len(indices):
+                        g_idx = indices[idx]
+                        qs = [int(x) for x in res[key] if str(x).isdigit()]
+                        if qs:
+                            FULL_MAP[g_idx] = qs
+                            job_log(job_id, f"   -> Found Qs: {qs}")
             
-            if batch_data:
-                for rel_idx, key in enumerate(sorted(batch_data.keys())):
-                    if rel_idx < len(batch_indices):
-                        g_idx = batch_indices[rel_idx]
-                        raw_qs = batch_data[key]
-                        clean_qs = [int(x) for x in raw_qs if str(x).isdigit()]
-                        if clean_qs:
-                            FULL_PAGE_GUIDANCE[g_idx] = clean_qs
-                            job_log(job_id, f"   -> Page {g_idx+1}: Found Qs {clean_qs}")
+            time.sleep(1.0)
             
-            time.sleep(1.0) 
+        # PHASE 2: EXTRACT & JSON
+        job_log(job_id, "✂️ Cropping & Generating JSON...")
+        questions_json = extract_questions(job_id, doc, FULL_MAP)
         
-        # PHASE 2: PROCESS
-        job_log(job_id, "✂️ Processing & Stitching...")
-        final_qs = extract_and_stitch(job_id, doc, FULL_PAGE_GUIDANCE)
-        
-        if not final_qs:
-            raise Exception("No questions extracted.")
+        if not questions_json:
+            raise Exception("No questions found after scanning.")
             
-        # PHASE 3: JSON & ZIP
-        job_log(job_id, "📦 Generating Data Package...")
-        
-        # JSON Structure with Hash (Fixed)
-        data_json = {
-            "testConfig": {"pdfFileHash": pdf_hash},
-            "pdfCropperData": {"Stark": {"Stark": {}}},
+        # --- FIXED DATA.JSON STRUCTURE ---
+        final_structure = {
+            "testConfig": {
+                "pdfFileHash": pdf_hash
+            },
+            "pdfCropperData": {
+                "Stark": {
+                    "Stark": questions_json
+                }
+            },
             "appVersion": "1.30.0",
-            "generatedBy": "Team_Stark_V32_Spatial"
+            "generatedBy": "Team_Stark_V33_Groq"
         }
         
-        for q in final_qs:
-            # We use the Label (e.g. "1") as the key
-            # Note: Filename logic handled above ensures files exist
-            key = q['label'] 
-            # If label was modified due to duplicate (e.g. "1_7"), use that
-            if "_" in q['filename']:
-                 # Stark__--__1_7__--__1.png -> extract 1_7
-                 key = q['filename'].split("__--__")[1]
-
-            data_json["pdfCropperData"]["Stark"]["Stark"][key] = {
-                "que": key, 
-                "type": "mcq", 
-                "marks": {"cm": 4, "im": -1},
-                "answerOptions": "4"
-            }
-            
         with open(os.path.join(EXPORT_DIR, "data.json"), "w") as f:
-            json.dump(data_json, f, indent=2)
-
+            json.dump(final_structure, f, indent=2)
+            
+        # PHASE 3: ZIP
+        job_log(job_id, "📦 Zipping Artifacts...")
         zip_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_result.zip")
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(EXPORT_DIR):
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+            for root, _, files in os.walk(EXPORT_DIR):
                 for file in files:
-                    zipf.write(os.path.join(root, file), file)
-        
+                    z.write(os.path.join(root, file), file)
+                    
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["file"] = zip_path
-        job_log(job_id, "✅ JOB COMPLETE. Downloading...")
+        job_log(job_id, "✅ JOB COMPLETED.")
         
     except Exception as e:
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
-        job_log(job_id, f"🔥 FATAL ERROR: {str(e)}")
+        job_log(job_id, f"🔥 FATAL: {str(e)}")
 
+# --- 🌐 ROUTES ---
 @app.route('/upload', methods=['POST'])
-def start_job():
-    if not is_authorized(request): return jsonify({"error": "Unauthorized"}), 403
-    if 'pdf' not in request.files: return jsonify({"error": "No file"}), 400
-    file = request.files['pdf']
-    job_id = str(uuid.uuid4())[:8]
-    save_path = os.path.join(UPLOAD_FOLDER, f"{job_id}.pdf")
-    file.save(save_path)
-    jobs[job_id] = {"status": "processing", "logs": [], "file": None, "error": None}
-    thread = threading.Thread(target=process_pdf_thread, args=(job_id, save_path))
-    thread.start()
-    return jsonify({"job_id": job_id, "message": "Job started"})
+def start():
+    if not is_authorized(request): return jsonify({"error": "Auth Failed"}), 403
+    if 'pdf' not in request.files: return jsonify({"error": "No PDF"}), 400
+    
+    f = request.files['pdf']
+    jid = str(uuid.uuid4())[:8]
+    path = os.path.join(UPLOAD_FOLDER, f"{jid}.pdf")
+    f.save(path)
+    
+    jobs[jid] = {"status": "processing", "logs": [], "file": None}
+    threading.Thread(target=process_thread, args=(jid, path)).start()
+    
+    return jsonify({"job_id": jid})
 
-@app.route('/status/<job_id>', methods=['GET'])
-def get_status(job_id):
-    if job_id not in jobs: return jsonify({"error": "Job not found"}), 404
-    return jsonify({
-        "status": jobs[job_id]["status"],
-        "logs": jobs[job_id]["logs"],
-        "error": jobs[job_id]["error"]
-    })
+@app.route('/status/<jid>', methods=['GET'])
+def status(jid):
+    if jid not in jobs: return jsonify({"error": "404"}), 404
+    return jsonify(jobs[jid])
 
-@app.route('/download/<job_id>', methods=['GET'])
-def download_result(job_id):
-    if job_id not in jobs or jobs[job_id]["status"] != "completed":
-        return jsonify({"error": "Not ready"}), 404
-    return send_file(jobs[job_id]["file"], as_attachment=True, download_name='Stark_Result.zip')
+@app.route('/download/<jid>', methods=['GET'])
+def download(jid):
+    if jid not in jobs or jobs[jid]["status"] != "completed": return jsonify({"error": "Wait"}), 400
+    return send_file(jobs[jid]["file"], as_attachment=True, download_name="Stark_Result.zip")
 
 @app.route('/')
-def home():
-    return "Team Stark V32 (Spatial Logic) 🚀"
+def index(): return "Stark V33 (Fixed JSON + Aggressive Groq)"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
