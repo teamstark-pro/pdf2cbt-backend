@@ -64,10 +64,12 @@ class SmartGroqManager:
         if not self.all_keys: return None, None
         now = time.time()
         available_keys = [k for k in self.all_keys if now >= self.key_cooldowns[k]]
+        
         if not available_keys:
             selected_key = random.choice(self.all_keys)
         else:
             selected_key = random.choice(available_keys)
+            
         return Groq(api_key=selected_key), selected_key
 
     def mark_rate_limited(self, key):
@@ -113,12 +115,80 @@ def pixmap_to_base64(pix):
     except Exception as e: return ""
 
 # ==========================================
-# STRATEGY 1: REGEX (With Strict Validation)
+# PHASE 0: AI RECONNAISSANCE (Get Pattern)
 # ==========================================
 
-def find_questions_via_regex(doc, pdf_type):
+def get_dynamic_regex_pattern(job_id, doc):
+    """
+    Sends the first page to Groq to identify the exact question numbering format.
+    Returns a Python-compatible Regex string.
+    """
+    try:
+        page = doc[0] # Analyze Page 1
+        pix = page.get_pixmap(dpi=100)
+        b64 = pixmap_to_base64(pix)
+        
+        prompt = """
+        Look at this exam page.
+        Identify how the questions are numbered.
+        
+        Examples:
+        - "1.", "2." -> Pattern: ^\s*(\d+)\.
+        - "Q1", "Q2" -> Pattern: ^\s*Q(\d+)
+        - "(1)", "(2)" -> Pattern: ^\s*\((\d+)\)
+        - "Question 1:", "Question 2:" -> Pattern: ^\s*Question\s*(\d+)[:\.]
+        - "1)", "2)" -> Pattern: ^\s*(\d+)\)
+        
+        TASK:
+        Return the **Single Best Python Regex** to capture the question number.
+        The regex MUST have a capturing group `(\d+)` for the number itself.
+        
+        OUTPUT JSON:
+        { "pattern": "raw_python_regex_string", "confidence": "high" }
+        """
+        
+        payload = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+        ]
+        
+        response = groq_manager.call_vision_batch(payload)
+        
+        if response and "pattern" in response:
+            pat = response["pattern"]
+            # Validate regex validity
+            try:
+                re.compile(pat)
+                return pat
+            except:
+                log_job(job_id, f"⚠️ AI returned invalid regex: {pat}. Using fallback.", "WARN")
+                return None
+    except Exception as e:
+        log_job(job_id, f"⚠️ AI Recon failed: {e}", "WARN")
+        return None
+    
+    return None
+
+# ==========================================
+# STRATEGY 1: REGEX (Dynamic)
+# ==========================================
+
+def find_questions_via_regex(doc, pdf_type, dynamic_pattern=None):
     questions = []
-    patterns = [r"^\s*(\d+)[\.\)\-\:]", r"^\s*Q(?:uestion)?[\.\s\-]*(\d+)", r"^\s*\[(\d+)\]", r"^\s*Problem\s*(\d+)"]
+    
+    # Default Patterns (Fallback)
+    patterns = [
+        r"^\s*(\d+)[\.\)\-\:]",           # 1. or 1)
+        r"^\s*Q(?:uestion)?[\.\s\-]*(\d+)", # Q1
+        r"^\s*\[(\d+)\]",                   # [1]
+        r"^\s*Problem\s*(\d+)"              # Problem 1
+    ]
+    
+    # If AI gave a pattern, prioritize it!
+    if dynamic_pattern:
+        log_job("SYSTEM", f"🎯 Using AI-Detected Regex: {dynamic_pattern}", "INFO")
+        patterns.insert(0, dynamic_pattern)
+        
     bad_keywords = ["Solution", "Answer", "Exp:", "Explanation", "Page", "Fig", "Table"]
     
     for p_idx in range(len(doc)):
@@ -126,6 +196,7 @@ def find_questions_via_regex(doc, pdf_type):
         width = page.rect.width
         blocks = page.get_text("blocks")
         
+        # Sort blocks to prevent zig-zag
         if pdf_type == 'double_col':
             midpoint = width / 2
             left_col = [b for b in blocks if b[0] < midpoint]
@@ -134,7 +205,7 @@ def find_questions_via_regex(doc, pdf_type):
             right_col.sort(key=lambda b: b[1])
             sorted_blocks = left_col + right_col
         else:
-            sorted_blocks = sorted(blocks, key=lambda b: b[1])
+            sorted_blocks = sorted(blocks, key=lambda b: (b[1], b[0]))
 
         for b in sorted_blocks:
             text = b[4].strip()
@@ -152,13 +223,13 @@ def find_questions_via_regex(doc, pdf_type):
                             "page": p_idx,
                             "rect": fitz.Rect(b[0], b[1], b[2], b[3])
                         })
-                        break
+                        break # Found a match for this block, move to next block
                     except: pass
 
     if not questions: return None
     questions.sort(key=lambda x: x["q_num"])
     
-    # Validation: Check for consistent sequence
+    # Strict Validation Sequence
     valid_qs = []
     last_q = 0
     strikes = 0
@@ -261,18 +332,16 @@ def crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type):
     return final_output
 
 # ==========================================
-# STRATEGY 2: VISION AI (Coordinates)
+# STRATEGY 2: VISION AI (Fallback)
 # ==========================================
 
 def get_questions_ai_coordinates(job_id, doc, page_indices, pdf_type):
-    # Simplified Prompt to avoid overwhelming the model
     base_text = """
     Analyze this exam page.
     Identify the FULL BOUNDING BOX for every question (Number + Text + Options).
     
     Output JSON: "img_0": [{ "q_num": Int, "x_start": Int(0-1000), "y_start": Int(0-1000), "x_end": Int(0-1000), "y_end": Int(0-1000) }]
     """
-    
     if pdf_type == 'double_col':
         base_text += "\nLayout: DOUBLE COLUMN. Scan Left column, then Right column."
     else:
@@ -309,14 +378,10 @@ def get_questions_ai_coordinates(job_id, doc, page_indices, pdf_type):
                             y0 = int(str(item.get("y_start", "0")).strip())
                             x1 = int(str(item.get("x_end", "1000")).strip())
                             y1 = int(str(item.get("y_end", "1000")).strip())
-                            
-                            # Sanity check
                             if x1 <= x0: x1 = 1000
                             if y1 <= y0: y1 = y0 + 50
-                            
                             cleaned_items.append({"q": q_num, "x0": x0, "y0": y0, "x1": x1, "y1": y1})
                         except: pass
-                
                 if pdf_type == 'double_col':
                     cleaned_items.sort(key=lambda x: (0 if x["x0"] < 500 else 1, x["y0"]))
                 else:
@@ -325,28 +390,29 @@ def get_questions_ai_coordinates(job_id, doc, page_indices, pdf_type):
     return result_map
 
 def extract_and_stitch_vision(job_id, doc, vision_map, export_dir, pdf_type):
-    # Re-using the same stitching logic as before but with vision data
-    # (Simplified for brevity, assuming similar structure to Regex stitcher but using vision coords)
     all_qs_coords = []
     for p_idx, items in vision_map.items():
         page = doc[p_idx]
         w = page.rect.width
         h = page.rect.height
         for item in items:
+            if pdf_type == 'single_col':
+                if item['x0'] < 100: item['x0'] = 0
+                if item['x1'] > 900: item['x1'] = 1000
+            elif pdf_type == 'double_col':
+                if item['x0'] < 20: item['x0'] = 0
+                if item['x1'] > 980: item['x1'] = 1000
+            
             x0 = (item['x0'] / 1000.0) * w
             y0 = (item['y0'] / 1000.0) * h
             x1 = (item['x1'] / 1000.0) * w
             y1 = (item['y1'] / 1000.0) * h
-            
-            # Snap Logic
-            if pdf_type == 'single_col' and x0 < 100: x0 = 0
-            if pdf_type == 'single_col' and x1 > 900: x1 = w
-            
             all_qs_coords.append({
                 "label": str(item['q']),
                 "q_num_int": item['q'],
                 "page": p_idx,
-                "rect": fitz.Rect(x0, y0, x1, y1)
+                "rect": fitz.Rect(x0, y0, x1, y1),
+                "raw_y1_score": item['y1']
             })
 
     all_qs_coords.sort(key=lambda x: x["q_num_int"])
@@ -354,26 +420,14 @@ def extract_and_stitch_vision(job_id, doc, vision_map, export_dir, pdf_type):
 
     final_output = []
     PAD = 20
-    
     for i, q in enumerate(all_qs_coords):
         curr_p = q["page"]
         rect = q["rect"]
-        
-        # Apply padding
-        safe_rect = fitz.Rect(
-            max(0, rect.x0 - PAD), max(0, rect.y0 - PAD),
-            min(doc[curr_p].rect.width, rect.x1 + PAD),
-            min(doc[curr_p].rect.height, rect.y1 + PAD)
-        )
-        
-        # Clip to page to avoid "tile outside image" error
+        safe_rect = fitz.Rect(max(0, rect.x0 - PAD), max(0, rect.y0 - PAD), min(doc[curr_p].rect.width, rect.x1 + PAD), min(doc[curr_p].rect.height, rect.y1 + PAD))
         clip_rect = safe_rect & doc[curr_p].rect
-        
         if clip_rect.is_empty: continue
-        
         pix = doc[curr_p].get_pixmap(dpi=200, clip=clip_rect)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        
         fname = f"Stark__--__{q['label']}__--__1.png"
         fpath = os.path.join(export_dir, fname)
         if os.path.exists(fpath):
@@ -381,7 +435,6 @@ def extract_and_stitch_vision(job_id, doc, vision_map, export_dir, pdf_type):
             fpath = os.path.join(export_dir, fname)
         img.save(fpath)
         final_output.append({"label": q['label'], "filename": fname})
-        
     return final_output
 
 # ==========================================
@@ -389,48 +442,31 @@ def extract_and_stitch_vision(job_id, doc, vision_map, export_dir, pdf_type):
 # ==========================================
 
 def analyze_pixel_layout(job_id, doc, export_dir, pdf_type):
-    """
-    Scans pages pixel-by-pixel to find whitespace gaps and separate questions.
-    Ideal for scanned PDFs where Regex fails and AI is dumb.
-    """
     final_output = []
     question_counter = 1
-    
     for p_idx in range(len(doc)):
         page = doc[p_idx]
-        
-        # Render page at low DPI for analysis (Fast)
         pix = page.get_pixmap(dpi=72)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         gray = ImageOps.grayscale(img)
-        
         width, height = gray.size
         pixels = gray.load()
-        
-        # Threshold: Consider < 200 as "Ink" (Dark)
         INK_THRESH = 200 
         
-        # Function to scan a vertical strip
         def get_segments(x_start, x_end):
             segments = []
             in_block = False
             start_y = 0
-            
-            # Scan rows
             for y in range(height):
                 has_ink = False
-                # Check a simplified row (skip every 2nd pixel for speed)
                 for x in range(int(x_start), int(x_end), 2):
                     if pixels[x, y] < INK_THRESH:
                         has_ink = True
                         break
-                
                 if has_ink and not in_block:
                     in_block = True
                     start_y = y
                 elif not has_ink and in_block:
-                    # Potential end of block
-                    # Check next 10 rows to be sure it's a real gap
                     is_gap = True
                     for next_y in range(y, min(y + 10, height)):
                         for next_x in range(int(x_start), int(x_end), 2):
@@ -438,62 +474,44 @@ def analyze_pixel_layout(job_id, doc, export_dir, pdf_type):
                                 is_gap = False
                                 break
                         if not is_gap: break
-                    
                     if is_gap:
                         in_block = False
-                        # Filter small noise blocks (< 30px height)
-                        if (y - start_y) > 30:
-                            segments.append((start_y, y))
-            
+                        if (y - start_y) > 30: segments.append((start_y, y))
             return segments
 
-        # Columns Logic
         if pdf_type == 'double_col':
             mid = width / 2
             col1_segs = get_segments(0, mid)
             col2_segs = get_segments(mid, width)
-            
-            # Process Left
             for (y0, y1) in col1_segs:
-                # Map back to PDF coordinates
                 scale_y = page.rect.height / height
                 scale_x = page.rect.width / width
                 rect = fitz.Rect(0, y0 * scale_y, mid * scale_x, y1 * scale_y)
                 final_output.append({"rect": rect, "page": p_idx})
-            
-            # Process Right
             for (y0, y1) in col2_segs:
                 scale_y = page.rect.height / height
                 scale_x = page.rect.width / width
                 rect = fitz.Rect(mid * scale_x, y0 * scale_y, width * scale_x, y1 * scale_y)
                 final_output.append({"rect": rect, "page": p_idx})
-                
-        else: # Single Col
+        else: 
             segs = get_segments(0, width)
             for (y0, y1) in segs:
                 scale_y = page.rect.height / height
                 rect = fitz.Rect(0, y0 * scale_y, page.rect.width, y1 * scale_y)
                 final_output.append({"rect": rect, "page": p_idx})
 
-    # Render Detected Blocks
     processed_files = []
-    
     for item in final_output:
         page = doc[item["page"]]
         rect = item["rect"]
-        
-        # Expand slightly
         clip_rect = fitz.Rect(rect.x0, max(0, rect.y0 - 10), rect.x1, min(page.rect.height, rect.y1 + 10))
-        
         pix = page.get_pixmap(dpi=200, clip=clip_rect)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        
         fname = f"Stark__--__{question_counter}__--__1.png"
         fpath = os.path.join(export_dir, fname)
         img.save(fpath)
         processed_files.append({"label": str(question_counter), "filename": fname})
         question_counter += 1
-        
     return processed_files
 
 # ==========================================
@@ -504,7 +522,6 @@ def worker_process(job_id, pdf_path, job_dir, pdf_type):
     with job_semaphore:
         export_dir = os.path.join(job_dir, "master_package")
         os.makedirs(export_dir, exist_ok=True)
-        
         try:
             doc = fitz.open(pdf_path)
             pdf_hash = get_pdf_hash(pdf_path)
@@ -512,22 +529,27 @@ def worker_process(job_id, pdf_path, job_dir, pdf_type):
             
             final_qs = []
             
-            # 1. Regex
-            log_job(job_id, "🔍 Strategy 1: Text Layer (Regex)...", "INFO")
-            questions = find_questions_via_regex(doc, pdf_type)
+            # PHASE 0: RECONNAISSANCE (Smart Regex)
+            log_job(job_id, "🛰️ AI Recon: Detecting Numbering Pattern...", "INFO")
+            dynamic_pattern = get_dynamic_regex_pattern(job_id, doc)
+            
+            # PHASE 1: REGEX SCAN
+            log_job(job_id, "🔍 Strategy 1: Text Layer (Smart Regex)...", "INFO")
+            questions = find_questions_via_regex(doc, pdf_type, dynamic_pattern)
+            
             if questions:
-                log_job(job_id, f"✅ Regex found {len(questions)} items.", "SUCCESS")
+                log_job(job_id, f"✅ Smart Regex found {len(questions)} items.", "SUCCESS")
                 final_qs = crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type)
             
-            # 2. Vision AI (Fallback 1)
+            # PHASE 2: VISION AI (Fallback)
             if not final_qs:
                 log_job(job_id, "⚠️ Regex failed. Strategy 2: Vision AI...", "WARN")
-                # ... (Vision AI Logic calls here - kept short for this block, relies on functions above)
                 FULL_VISION_DATA = {}
                 BATCH_SIZE = 2
                 batches = [list(range(i, min(i + BATCH_SIZE, len(doc)))) for i in range(0, len(doc), BATCH_SIZE)]
                 for indices in batches:
-                    batch_doc = fitz.open(pdf_path)
+                    log_job(job_id, f"   -> AI Scanning Pages {[p+1 for p in indices]}...", "INFO")
+                    batch_doc = fitz.open(pdf_path) 
                     try:
                         res = get_questions_ai_coordinates(job_id, batch_doc, indices, pdf_type)
                         if res: 
@@ -535,15 +557,15 @@ def worker_process(job_id, pdf_path, job_dir, pdf_type):
                         time.sleep(1)
                     except: pass
                     finally: batch_doc.close()
-                
                 if FULL_VISION_DATA:
+                    log_job(job_id, "✂️ Vision Cropping...", "INFO")
                     main_doc = fitz.open(pdf_path)
                     final_qs = extract_and_stitch_vision(job_id, main_doc, FULL_VISION_DATA, export_dir, pdf_type)
                     main_doc.close()
 
-            # 3. Pixel Layout (Fallback 2 - Ultimate)
+            # PHASE 3: PIXEL LAYOUT (Last Resort)
             if not final_qs:
-                log_job(job_id, "⚠️ Vision AI failed. Strategy 3: Pixel Layout (Scanned)...", "WARN")
+                log_job(job_id, "⚠️ Vision AI failed. Strategy 3: Pixel Layout...", "WARN")
                 main_doc = fitz.open(pdf_path)
                 final_qs = analyze_pixel_layout(job_id, main_doc, export_dir, pdf_type)
                 main_doc.close()
@@ -551,41 +573,34 @@ def worker_process(job_id, pdf_path, job_dir, pdf_type):
                     log_job(job_id, f"✅ Pixel Scan found {len(final_qs)} blocks.", "SUCCESS")
 
             if not final_qs:
-                raise Exception("All strategies failed. PDF is likely unreadable or encrypted.")
+                raise Exception("All strategies failed.")
                 
             log_job(job_id, "📦 Packaging...", "INFO")
-            
             data_json = {
                 "testConfig": {"pdfFileHash": pdf_hash},
                 "pdfCropperData": {"Stark": {"Stark": {}}},
                 "appVersion": "1.30.0",
-                "generatedBy": "Team_Stark_Hybrid_V33"
+                "generatedBy": "Team_Stark_Smart_V33"
             }
-            
             for q in final_qs:
                 key = q['label']
                 if "_" in q['filename']:
                      try: key = q['filename'].split("__--__")[1]
                      except: pass
-
                 data_json["pdfCropperData"]["Stark"]["Stark"][key] = {
                     "que": key, "type": "mcq", "marks": {"cm": 4, "im": -1},
                     "answerOptions": "4", "pdfData": [{"x1": 5, "x2": 995, "y1": 100, "y2": 500, "page": 1}]
                 }
-            
             with open(os.path.join(export_dir, "data.json"), "w") as f:
                 json.dump(data_json, f, indent=2)
-
             zip_path = os.path.join(job_dir, f"{job_id}_result.zip")
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for root, dirs, files in os.walk(export_dir):
                     for file in files:
                         zipf.write(os.path.join(root, file), file)
-            
             jobs[job_id]["status"] = "completed"
             jobs[job_id]["file_path"] = zip_path
-            log_job(job_id, "✅ DONE.", "SUCCESS")
-            
+            log_job(job_id, "✅ JOB COMPLETE.", "SUCCESS")
         except Exception as e:
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["error"] = str(e)
@@ -597,28 +612,21 @@ def worker_process(job_id, pdf_path, job_dir, pdf_type):
             gc.collect()
 
 # --- API ROUTES ---
-
 @app.route('/upload', methods=['POST'])
 def start_job():
     if not is_authorized(request): return jsonify({"error": "Unauthorized"}), 403
     if 'pdf' not in request.files: return jsonify({"error": "No file"}), 400
-    
     file = request.files['pdf']
     job_id = str(uuid.uuid4())[:8]
     pdf_type = request.form.get('pdf_type', 'single_col')
-    
     job_dir = os.path.join(BASE_TEMP_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
-    
     save_path = os.path.join(job_dir, "source.pdf")
     file.save(save_path)
-    
     jobs[job_id] = {"status": "queued", "logs": [], "file_path": None, "error": None}
-    
     thread = threading.Thread(target=worker_process, args=(job_id, save_path, job_dir, pdf_type))
     thread.daemon = True
     thread.start()
-    
     return jsonify({"job_id": job_id, "message": "Job queued/started"})
 
 @app.route('/status/<job_id>', methods=['GET'])
@@ -638,7 +646,7 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Tri-Hybrid Engine) 🚀"
+    return "Team Stark V33 (Smart Regex + Fallback) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
