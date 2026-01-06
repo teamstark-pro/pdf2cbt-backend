@@ -127,37 +127,79 @@ def pixmap_to_base64(pix):
 
 # --- CORE LOGIC ---
 
-def get_questions_ai_coordinates(job_id, doc, page_indices):
+def get_prompt_for_type(pdf_type):
+    """
+    Returns specific instructions based on the user's selected PDF layout.
+    """
+    base_rules = """
+    OUTPUT RULES:
+    Return JSON. Key: "img_0", Value: LIST of objects:
+    {
+       "q_num": Integer,
+       "x_start": Integer (0-1000),
+       "y_start": Integer (0-1000),
+       "x_end": Integer (0-1000),
+       "y_end": Integer (0-1000)
+    }
+    """
+
+    if pdf_type == 'double_col':
+        return f"""
+        Analyze this exam page which uses a **DOUBLE COLUMN** layout (Left and Right).
+        
+        TASK:
+        Identify the bounding box for every question.
+        
+        LAYOUT RULES (DOUBLE COLUMN):
+        1. **Split the page** vertically in your mind (approx x=500).
+        2. Read the **Left Column** first (Questions 1, 2, 3...).
+        3. Then read the **Right Column** (Questions 4, 5, 6...).
+        4. **CRITICAL:** Do NOT confuse questions across the horizontal line. 
+           - Left column items must have x_end < 500.
+           - Right column items must have x_start > 500.
+        
+        {base_rules}
+        """
+    elif pdf_type == 'raw_text':
+        return f"""
+        Analyze this document which contains a **SIMPLE LIST** of questions.
+        
+        TASK:
+        Identify the bounding box for every numbered item.
+        
+        LAYOUT RULES (RAW/SIMPLE):
+        1. Look for numbers "1.", "2)", "3-".
+        2. Ignore complex headers or sidebars.
+        3. Assume the question takes up the full width available.
+        
+        {base_rules}
+        """
+    else: # single_col (Default)
+        return f"""
+        Analyze this exam page which uses a **SINGLE COLUMN** layout.
+        
+        TASK:
+        Identify the bounding box for every question.
+        
+        LAYOUT RULES (SINGLE COLUMN):
+        1. Questions flow from Top to Bottom.
+        2. Each question occupies the **FULL WIDTH** of the page.
+        3. **x_start** should be near 0 and **x_end** near 1000 for almost all items.
+        4. Do NOT split a single line into two columns. Treat it as one block.
+        
+        {base_rules}
+        """
+
+def get_questions_ai_coordinates(job_id, doc, page_indices, pdf_type):
+    """
+    Fetches coordinates using a layout-specific prompt.
+    """
+    prompt_text = get_prompt_for_type(pdf_type)
+    
     payload_content = [
         {
             "type": "text",
-            "text": """
-            Analyze these exam pages.
-            
-            TASK:
-            Identify the FULL BOUNDING BOX for every question block found.
-            
-            UNIVERSAL LAYOUT INSTRUCTIONS:
-            1. **BE GENEROUS**: It is better to include extra whitespace than to cut off text.
-            2. **Start** at the Question Number.
-            3. **End** below the last option (A, B, C, D) or Answer block.
-            4. **WIDTH**:
-               - If the text looks like it spans the whole page, set x_start near 0 and x_end near 1000.
-               - If it is in a column, capture the FULL column width.
-            
-            OUTPUT RULES:
-            Return JSON. Key: "img_0", Value: LIST of objects:
-            {
-               "q_num": Integer,
-               "x_start": Integer (0-1000),
-               "y_start": Integer (0-1000),
-               "x_end": Integer (0-1000),
-               "y_end": Integer (0-1000)
-            }
-            
-            MULTI-PAGE RULE:
-            - If a question continues to the next page, set "y_end" to 1000.
-            """
+            "text": prompt_text
         }
     ]
 
@@ -198,6 +240,7 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                             x1 = int(str(item.get("x_end", "1000")).strip())
                             y1 = int(str(item.get("y_end", "1000")).strip())
                             
+                            # Validations
                             if x1 <= x0: x1 = 1000
                             if y1 <= y0: y1 = y0 + 100
                             
@@ -208,12 +251,20 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                             })
                         except: pass
                 
-                cleaned_items.sort(key=lambda x: (x["y0"], x["x0"]))
+                # Sort logic based on Layout Type
+                if pdf_type == 'double_col':
+                    # Sort by Column (Left then Right) then Top-Down
+                    # Heuristic: Left Col (x < 500), Right Col (x > 500)
+                    cleaned_items.sort(key=lambda x: (0 if x["x0"] < 500 else 1, x["y0"]))
+                else:
+                    # Standard Top-Down sort
+                    cleaned_items.sort(key=lambda x: x["y0"])
+                    
                 result_map[real_page_idx] = cleaned_items
                 
     return result_map
 
-def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
+def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir, pdf_type):
     all_qs_coords = []
     
     for p_idx, items in vision_map.items():
@@ -222,10 +273,15 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         h = page.rect.height
         
         for item in items:
-            # Snap X-Start
-            if item['x0'] < 20: item['x0'] = 0
-            # Snap X-End
-            if item['x1'] > 980: item['x1'] = 1000
+            # Layout Specific Snapping
+            if pdf_type == 'single_col':
+                # Aggressive width snapping for single col
+                if item['x0'] < 100: item['x0'] = 0
+                if item['x1'] > 900: item['x1'] = 1000
+            elif pdf_type == 'double_col':
+                # More conservative snapping for double col
+                if item['x0'] < 20: item['x0'] = 0
+                if item['x1'] > 980: item['x1'] = 1000
             
             x0 = (item['x0'] / 1000.0) * w
             y0 = (item['y0'] / 1000.0) * h
@@ -240,15 +296,16 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
                 "raw_y1_score": item['y1']
             })
 
-    # Sort primarily by Question Number to fix sequencing
+    # Strict Sort by Question Number for final stitching
     all_qs_coords.sort(key=lambda x: x["q_num_int"])
     
-    log_job(job_id, f"✅ AI identified {len(all_qs_coords)} bounding boxes.", "INFO")
+    log_job(job_id, f"✅ AI identified {len(all_qs_coords)} items.", "INFO")
     
     if not all_qs_coords: return []
 
     final_output = []
     
+    # Universal Padding
     PAD_Y_TOP = 40  
     PAD_Y_BOTTOM = 50 
     PAD_X = 30  
@@ -264,12 +321,14 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         
         is_multipage = False
         
+        # Multipage detection logic
         if q["raw_y1_score"] >= 980:
              is_multipage = True
              safe_y1 = doc[curr_p].rect.height - 40
         elif i + 1 < len(all_qs_coords):
              next_q = all_qs_coords[i+1]
-             if next_q["page"] > curr_p and q["raw_y1_score"] > 900:
+             # Only assume multipage if next Q is strictly on a later page
+             if next_q["page"] > curr_p:
                  is_multipage = True
                  safe_y1 = doc[curr_p].rect.height - 40
 
@@ -302,9 +361,6 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         
         for seg in segments:
             page = doc[seg['page']]
-            
-            # --- CRITICAL FIX: Safe Intersection ---
-            # Intersect with page bounds to prevent "tile cannot extend outside image" crash
             clip_rect = seg['rect'] & page.rect
             
             if clip_rect.is_empty or clip_rect.width <= 0 or clip_rect.height <= 0:
@@ -316,9 +372,7 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
                 images.append(img)
                 total_h += img.height
                 max_w = max(max_w, img.width)
-            except Exception as e:
-                print(f"Render Error Q{q['label']}: {e}")
-                continue
+            except: continue
         
         if not images: continue
         
@@ -340,7 +394,7 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         
     return final_output
 
-def worker_process(job_id, pdf_path, job_dir):
+def worker_process(job_id, pdf_path, job_dir, pdf_type):
     with job_semaphore:
         export_dir = os.path.join(job_dir, "master_package")
         os.makedirs(export_dir, exist_ok=True)
@@ -358,49 +412,48 @@ def worker_process(job_id, pdf_path, job_dir):
             return
 
         try:
-            log_job(job_id, f"🚀 STARTING JOB (Sequential). Pages: {total_pages}", "INFO")
+            log_job(job_id, f"🚀 JOB STARTED ({pdf_type.upper()}). Pages: {total_pages}", "INFO")
             
             FULL_VISION_DATA = {}
-            # Reduced Batch Size to 2 to improve reliability/completion rate
             BATCH_SIZE = 2 
             batches = []
             for i in range(0, total_pages, BATCH_SIZE):
                 indices = list(range(i, min(i + BATCH_SIZE, total_pages)))
                 batches.append(indices)
                 
-            log_job(job_id, f"⚡ Processing {len(batches)} batches sequentially...", "INFO")
+            log_job(job_id, f"⚡ Processing {len(batches)} batches...", "INFO")
 
             for indices in batches:
                 log_job(job_id, f"   -> Scanning Pages {[p+1 for p in indices]}...", "INFO")
                 batch_doc = fitz.open(pdf_path)
                 try:
-                    result = get_questions_ai_coordinates(job_id, batch_doc, indices)
+                    result = get_questions_ai_coordinates(job_id, batch_doc, indices, pdf_type)
                     if result:
                         for k, v in result.items():
                             FULL_VISION_DATA[k] = v
                             q_nums = [x['q'] for x in v]
                             log_job(job_id, f"      Found Qs: {q_nums}", "INFO")
                     else:
-                        log_job(job_id, "      No questions found in this batch.", "WARN")
+                        log_job(job_id, "      No questions found.", "WARN")
                     time.sleep(1) 
                 except Exception as e:
-                    log_job(job_id, f"      Batch Error: {str(e)}", "ERROR")
+                    log_job(job_id, f"      Error: {str(e)}", "ERROR")
                 finally:
                     batch_doc.close()
 
             if not FULL_VISION_DATA:
-                 raise Exception("Scan completed but no questions were found.")
+                 raise Exception("No questions found.")
 
-            log_job(job_id, "✂️ Universal Cropping (Snap-to-Edge)...", "INFO")
+            log_job(job_id, "✂️ Cropping...", "INFO")
             
             main_doc = fitz.open(pdf_path)
-            final_qs = extract_and_stitch_pure_vision(job_id, main_doc, FULL_VISION_DATA, export_dir)
+            final_qs = extract_and_stitch_pure_vision(job_id, main_doc, FULL_VISION_DATA, export_dir, pdf_type)
             main_doc.close()
             
             if not final_qs:
-                raise Exception("No valid questions generated.")
+                raise Exception("Cropping failed.")
                 
-            log_job(job_id, "📦 Generating Data Package...", "INFO")
+            log_job(job_id, "📦 Packaging...", "INFO")
             
             data_json = {
                 "testConfig": {"pdfFileHash": pdf_hash},
@@ -435,12 +488,12 @@ def worker_process(job_id, pdf_path, job_dir):
             
             jobs[job_id]["status"] = "completed"
             jobs[job_id]["file_path"] = zip_path
-            log_job(job_id, "✅ JOB COMPLETE. Ready for download.", "SUCCESS")
+            log_job(job_id, "✅ DONE.", "SUCCESS")
             
         except Exception as e:
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["error"] = str(e)
-            log_job(job_id, f"🔥 FATAL ERROR: {str(e)}", "ERROR")
+            log_job(job_id, f"🔥 FATAL: {str(e)}", "ERROR")
         finally:
             try:
                 shutil.rmtree(export_dir)
@@ -456,6 +509,7 @@ def start_job():
     
     file = request.files['pdf']
     job_id = str(uuid.uuid4())[:8]
+    pdf_type = request.form.get('pdf_type', 'single_col') # Get Layout Type
     
     job_dir = os.path.join(BASE_TEMP_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -465,7 +519,7 @@ def start_job():
     
     jobs[job_id] = {"status": "queued", "logs": [], "file_path": None, "error": None}
     
-    thread = threading.Thread(target=worker_process, args=(job_id, save_path, job_dir))
+    thread = threading.Thread(target=worker_process, args=(job_id, save_path, job_dir, pdf_type))
     thread.daemon = True
     thread.start()
     
@@ -488,7 +542,7 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Sequential + Safe Crops) 🚀"
+    return "Team Stark V33 (Layout Aware + Safe Crops) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
