@@ -125,8 +125,8 @@ def pixmap_to_base64(pix):
 
 def get_questions_ai_coordinates(job_id, doc, page_indices):
     """
-    Asks Groq to return not just the question number, but the Y-COORDINATE (0-1000 scale).
-    Optimized prompt for better accuracy.
+    Asks Groq for EXACT crop coordinates (Start AND End).
+    Scale: 0-1000 (0=Top, 1000=Bottom).
     """
     payload_content = [
         {
@@ -135,23 +135,24 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
             Analyze these exam pages.
             
             TASK:
-            Identify the START of every question.
+            Identify the EXACT vertical bounding box for every question.
             
-            CRITICAL OUTPUT RULES:
-            1. Return a JSON object where keys are the image labels (e.g., "img_0").
-            2. The value must be a LIST of objects containing:
-               - "q_num": The question number (integer).
-               - "y_start": The vertical Y-coordinate where the question number visually starts (scale 0-1000).
+            OUTPUT RULES:
+            Return a JSON object with keys like "img_0".
+            Value is a LIST of objects:
+            {
+               "q_num": Integer (Question Number),
+               "y_start": Integer (0-1000) - Exact top pixel of the question number.
+               "y_end": Integer (0-1000) - Exact bottom pixel of the LAST option/text of this question.
+            }
             
-            ACCURACY TIP:
-            - Look for the whitespace ABOVE the question number. 
-            - Set "y_start" to the top edge of the Question Number text (e.g., "Q1", "1.").
+            IMPORTANT:
+            - "y_end" must include all options (A, B, C, D).
+            - Do NOT include the next question in the range.
+            - If a question continues to the next page, set "y_end" to 1000.
             
-            EXAMPLE OUTPUT:
-            { "img_0": [ {"q_num": 1, "y_start": 50}, {"q_num": 2, "y_start": 450} ] }
-            
-            IGNORE:
-            - Solutions, Answers, Explanations.
+            EXAMPLE:
+            { "img_0": [ {"q_num": 1, "y_start": 50, "y_end": 400}, {"q_num": 2, "y_start": 420, "y_end": 800} ] }
             """
         }
     ]
@@ -189,10 +190,20 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                         try:
                             q_num = int(str(item.get("q_num", "")).strip())
                             y_start = int(str(item.get("y_start", "0")).strip())
-                            cleaned_items.append({"q": q_num, "y": y_start})
+                            y_end = int(str(item.get("y_end", "0")).strip())
+                            
+                            # Validations
+                            if y_end == 0: y_end = 1000 # Default to bottom if missing
+                            if y_end <= y_start: y_end = y_start + 100
+                            
+                            cleaned_items.append({
+                                "q": q_num, 
+                                "y0": y_start, 
+                                "y1": y_end
+                            })
                         except: pass
                 
-                cleaned_items.sort(key=lambda x: x["y"])
+                cleaned_items.sort(key=lambda x: x["y0"])
                 result_map[real_page_idx] = cleaned_items
                 
     return result_map
@@ -203,16 +214,20 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
     for p_idx, items in vision_map.items():
         page_h = doc[p_idx].rect.height
         for item in items:
-            normalized_y = item['y']
-            actual_y = (normalized_y / 1000.0) * page_h
+            # Convert 0-1000 scale to actual PDF points
+            y0_px = (item['y0'] / 1000.0) * page_h
+            y1_px = (item['y1'] / 1000.0) * page_h
+            
             all_qs_coords.append({
                 "label": str(item['q']),
                 "page": p_idx,
-                "y0": actual_y
+                "y0": y0_px,
+                "y1": y1_px,
+                "raw_y1_score": item['y1'] # Keep raw score to check for page breaks
             })
 
     all_qs_coords.sort(key=lambda x: (x["page"], x["y0"]))
-    log_job(job_id, f"✅ AI identified {len(all_qs_coords)} start points directly.", "INFO")
+    log_job(job_id, f"✅ AI identified {len(all_qs_coords)} blocks with Start & End coordinates.", "INFO")
     
     if not all_qs_coords: return []
 
@@ -221,40 +236,58 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
     for i, q in enumerate(all_qs_coords):
         curr_p = q["page"]
         
-        # Buffer: Start slightly above detected point
-        y_start = max(0, q["y0"] - 15)
+        # Start Buffer
+        y_start = max(0, q["y0"] - 10)
+        
+        # Decide y_end
+        # Priority 1: Use AI's y1
+        y_end = q["y1"] + 10 # Buffer
+        
+        # Priority 2: Multi-page logic
+        # If AI says it ends near the bottom (>980/1000), OR if the next question is on a NEW page
+        # we treat this as a potentially stitched question.
+        
+        is_multipage = False
         
         if i + 1 < len(all_qs_coords):
             next_q = all_qs_coords[i+1]
-            if next_q["page"] == curr_p:
-                # Same page: Cut before next Q
-                y_end = max(y_start + 20, next_q["y0"] - 10)
-            else:
-                # Next page: Take until bottom
-                y_end = doc[curr_p].rect.height - 40
-        else:
-            y_end = doc[curr_p].rect.height - 40
+            if next_q["page"] > curr_p:
+                is_multipage = True
+        
+        # Override y_end if it's multipage to ensure we capture the footer area for stitching
+        if is_multipage or q["raw_y1_score"] >= 980:
+             y_end = doc[curr_p].rect.height - 40 # Bottom margin
+        
+        # Safeguard: Don't overlap next question on SAME page
+        if i + 1 < len(all_qs_coords):
+             next_q = all_qs_coords[i+1]
+             if next_q["page"] == curr_p:
+                 # If AI's y_end overlaps next Q's start, trim it.
+                 if y_end > next_q["y0"]:
+                     y_end = next_q["y0"] - 10
 
         pages_to_process = []
         
-        # A: Same Page
-        if i + 1 < len(all_qs_coords) and all_qs_coords[i+1]["page"] == curr_p:
+        # A: Same Page (Most common)
+        if not is_multipage:
              pages_to_process.append((curr_p, y_start, y_end))
         
-        # B: Multi-Page
-        elif i + 1 < len(all_qs_coords) and all_qs_coords[i+1]["page"] > curr_p:
+        # B: Multi-Page Stitching
+        else:
+            # 1. Remainder of Current Page
             pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 40))
-            for gap_p in range(curr_p + 1, all_qs_coords[i+1]["page"]):
+            
+            # 2. Intermediate Pages
+            next_q_page = all_qs_coords[i+1]["page"]
+            for gap_p in range(curr_p + 1, next_q_page):
                 pages_to_process.append((gap_p, 40, doc[gap_p].rect.height - 40))
             
-            next_p_idx = all_qs_coords[i+1]["page"]
-            next_q_y = all_qs_coords[i+1]["y0"] - 15
+            # 3. Top of Next Page
+            # For the end of the stitch, we need the start of the next question
+            next_q = all_qs_coords[i+1]
+            next_q_y = next_q["y0"] - 15
             next_q_y = max(50, next_q_y) 
-            pages_to_process.append((next_p_idx, 40, next_q_y))
-            
-        # C: Last Q
-        else:
-            pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 40))
+            pages_to_process.append((next_q_page, 40, next_q_y))
 
         images = []
         total_h = 0
@@ -305,21 +338,18 @@ def worker_process(job_id, pdf_path, job_dir):
         FULL_VISION_DATA = {}
         
         # --- PARALLEL BATCH PROCESSING ---
-        BATCH_SIZE = 4 # Increased from 2 to 4 (Max 5 images per req)
+        BATCH_SIZE = 4 
         batches = []
         
-        # Prepare batches
         for i in range(0, total_pages, BATCH_SIZE):
             indices = list(range(i, min(i + BATCH_SIZE, total_pages)))
             batches.append(indices)
             
         log_job(job_id, f"⚡ Parallel Scanning {len(batches)} batches...", "INFO")
 
-        # Define wrapper for thread executor
         def process_batch(indices):
             return indices, get_questions_ai_coordinates(job_id, doc, indices)
 
-        # Run concurrently
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             future_to_batch = {executor.submit(process_batch, b): b for b in batches}
             
@@ -332,7 +362,7 @@ def worker_process(job_id, pdf_path, job_dir):
                         log_job(job_id, f"   -> Page {k+1}: Found Qs {q_nums}", "INFO")
 
         # PHASE 2: CROP
-        log_job(job_id, "✂️ Cropping based on Vision Coordinates...", "INFO")
+        log_job(job_id, "✂️ Cropping using Groq's Exact Coordinates...", "INFO")
         final_qs = extract_and_stitch_pure_vision(job_id, doc, FULL_VISION_DATA, export_dir)
         
         if not final_qs:
