@@ -125,8 +125,8 @@ def pixmap_to_base64(pix):
 
 def get_questions_ai_coordinates(job_id, doc, page_indices):
     """
-    Asks Groq for EXACT crop coordinates (Start AND End).
-    Scale: 0-1000 (0=Top, 1000=Bottom).
+    Asks Groq for EXACT BOUNDING BOX (X and Y).
+    Scale: 0-1000.
     """
     payload_content = [
         {
@@ -135,24 +135,29 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
             Analyze these exam pages.
             
             TASK:
-            Identify the EXACT vertical bounding box for every question.
+            Identify the EXACT bounding box for every question (including its options).
             
             OUTPUT RULES:
             Return a JSON object with keys like "img_0".
             Value is a LIST of objects:
             {
                "q_num": Integer (Question Number),
-               "y_start": Integer (0-1000) - Exact top pixel of the question number.
-               "y_end": Integer (0-1000) - Exact bottom pixel of the LAST option/text of this question.
+               "x_start": Integer (0-1000) - Left edge.
+               "y_start": Integer (0-1000) - Top edge.
+               "x_end": Integer (0-1000) - Right edge.
+               "y_end": Integer (0-1000) - Bottom edge (end of options).
             }
             
             IMPORTANT:
+            - Handle MULTI-COLUMN layouts correctly. If Q1 is in Col A, x_end should be ~480. If Q6 is in Col B, x_start should be ~520.
             - "y_end" must include all options (A, B, C, D).
-            - Do NOT include the next question in the range.
             - If a question continues to the next page, set "y_end" to 1000.
             
             EXAMPLE:
-            { "img_0": [ {"q_num": 1, "y_start": 50, "y_end": 400}, {"q_num": 2, "y_start": 420, "y_end": 800} ] }
+            { "img_0": [ 
+               {"q_num": 1, "x_start": 50, "y_start": 50, "x_end": 450, "y_end": 400}, 
+               {"q_num": 2, "x_start": 500, "y_start": 50, "x_end": 950, "y_end": 350} 
+            ] }
             """
         }
     ]
@@ -189,21 +194,26 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                     for item in item_list:
                         try:
                             q_num = int(str(item.get("q_num", "")).strip())
-                            y_start = int(str(item.get("y_start", "0")).strip())
-                            y_end = int(str(item.get("y_end", "0")).strip())
                             
-                            # Validations
-                            if y_end == 0: y_end = 1000 # Default to bottom if missing
-                            if y_end <= y_start: y_end = y_start + 100
+                            # Parse all 4 coordinates
+                            x0 = int(str(item.get("x_start", "0")).strip())
+                            y0 = int(str(item.get("y_start", "0")).strip())
+                            x1 = int(str(item.get("x_end", "1000")).strip())
+                            y1 = int(str(item.get("y_end", "1000")).strip())
+                            
+                            # Sanity Checks
+                            if x1 <= x0: x1 = x0 + 100
+                            if y1 <= y0: y1 = y0 + 100
                             
                             cleaned_items.append({
                                 "q": q_num, 
-                                "y0": y_start, 
-                                "y1": y_end
+                                "x0": x0, "y0": y0, 
+                                "x1": x1, "y1": y1
                             })
                         except: pass
                 
-                cleaned_items.sort(key=lambda x: x["y0"])
+                # Sort by Y position mainly
+                cleaned_items.sort(key=lambda x: (x["y0"], x["x0"]))
                 result_map[real_page_idx] = cleaned_items
                 
     return result_map
@@ -212,95 +222,102 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
     all_qs_coords = []
     
     for p_idx, items in vision_map.items():
-        page_h = doc[p_idx].rect.height
+        page = doc[p_idx]
+        w = page.rect.width
+        h = page.rect.height
+        
         for item in items:
             # Convert 0-1000 scale to actual PDF points
-            y0_px = (item['y0'] / 1000.0) * page_h
-            y1_px = (item['y1'] / 1000.0) * page_h
+            x0 = (item['x0'] / 1000.0) * w
+            y0 = (item['y0'] / 1000.0) * h
+            x1 = (item['x1'] / 1000.0) * w
+            y1 = (item['y1'] / 1000.0) * h
             
             all_qs_coords.append({
                 "label": str(item['q']),
                 "page": p_idx,
-                "y0": y0_px,
-                "y1": y1_px,
-                "raw_y1_score": item['y1'] # Keep raw score to check for page breaks
+                "rect": fitz.Rect(x0, y0, x1, y1),
+                "raw_y1_score": item['y1'] # Check for page trailing
             })
 
-    all_qs_coords.sort(key=lambda x: (x["page"], x["y0"]))
-    log_job(job_id, f"✅ AI identified {len(all_qs_coords)} blocks with Start & End coordinates.", "INFO")
+    all_qs_coords.sort(key=lambda x: (x["page"], x["rect"].y0))
+    log_job(job_id, f"✅ AI identified {len(all_qs_coords)} bounding boxes.", "INFO")
     
     if not all_qs_coords: return []
 
     final_output = []
     
+    PAD_Y = 15  # Buffer top/bottom
+    PAD_X = 10  # Buffer left/right
+    
     for i, q in enumerate(all_qs_coords):
         curr_p = q["page"]
+        orig_rect = q["rect"]
         
-        # Start Buffer
-        y_start = max(0, q["y0"] - 10)
+        # Apply padding (Buffer)
+        # Ensure we don't go out of page bounds
+        safe_x0 = max(0, orig_rect.x0 - PAD_X)
+        safe_y0 = max(0, orig_rect.y0 - PAD_Y)
+        safe_x1 = min(doc[curr_p].rect.width, orig_rect.x1 + PAD_X)
+        safe_y1 = min(doc[curr_p].rect.height, orig_rect.y1 + PAD_Y)
         
-        # Decide y_end
-        # Priority 1: Use AI's y1
-        y_end = q["y1"] + 10 # Buffer
-        
-        # Priority 2: Multi-page logic
-        # If AI says it ends near the bottom (>980/1000), OR if the next question is on a NEW page
-        # we treat this as a potentially stitched question.
-        
+        # Check for Multipage Trailing
+        # If AI says it ends at bottom (>980) OR next question is on next page
         is_multipage = False
         
-        if i + 1 < len(all_qs_coords):
-            next_q = all_qs_coords[i+1]
-            if next_q["page"] > curr_p:
-                is_multipage = True
-        
-        # Override y_end if it's multipage to ensure we capture the footer area for stitching
-        if is_multipage or q["raw_y1_score"] >= 980:
-             y_end = doc[curr_p].rect.height - 40 # Bottom margin
-        
-        # Safeguard: Don't overlap next question on SAME page
-        if i + 1 < len(all_qs_coords):
+        if q["raw_y1_score"] >= 980:
+             is_multipage = True
+             safe_y1 = doc[curr_p].rect.height - 40 # Margin
+        elif i + 1 < len(all_qs_coords):
              next_q = all_qs_coords[i+1]
-             if next_q["page"] == curr_p:
-                 # If AI's y_end overlaps next Q's start, trim it.
-                 if y_end > next_q["y0"]:
-                     y_end = next_q["y0"] - 10
+             # logic: if next Q is on next page, current MIGHT be trailing
+             # BUT only if current Y end is close to bottom
+             if next_q["page"] > curr_p and q["raw_y1_score"] > 900:
+                 is_multipage = True
+                 safe_y1 = doc[curr_p].rect.height - 40
 
-        pages_to_process = []
+        segments = []
         
-        # A: Same Page (Most common)
-        if not is_multipage:
-             pages_to_process.append((curr_p, y_start, y_end))
+        # Segment 1: The main box on current page
+        segments.append({
+            "page": curr_p,
+            "rect": fitz.Rect(safe_x0, safe_y0, safe_x1, safe_y1)
+        })
         
-        # B: Multi-Page Stitching
-        else:
-            # 1. Remainder of Current Page
-            pages_to_process.append((curr_p, y_start, doc[curr_p].rect.height - 40))
-            
-            # 2. Intermediate Pages
-            next_q_page = all_qs_coords[i+1]["page"]
-            for gap_p in range(curr_p + 1, next_q_page):
-                pages_to_process.append((gap_p, 40, doc[gap_p].rect.height - 40))
-            
-            # 3. Top of Next Page
-            # For the end of the stitch, we need the start of the next question
+        # Segment 2+: Stitching (Next Page)
+        if is_multipage and i + 1 < len(all_qs_coords):
             next_q = all_qs_coords[i+1]
-            next_q_y = next_q["y0"] - 15
-            next_q_y = max(50, next_q_y) 
-            pages_to_process.append((next_q_page, 40, next_q_y))
+            next_q_page = next_q["page"]
+            
+            # If gap between pages, grab full intermediate pages
+            # BUT restrict width to the original column width (safe_x0, safe_x1)
+            for gap_p in range(curr_p + 1, next_q_page):
+                segments.append({
+                    "page": gap_p,
+                    "rect": fitz.Rect(safe_x0, 40, safe_x1, doc[gap_p].rect.height - 40)
+                })
+            
+            # Final part on next page (until next Q starts)
+            # We assume the column layout persists
+            # End Y is where next question starts
+            next_q_y = next_q["rect"].y0 - 15
+            next_q_y = max(50, next_q_y)
+            
+            segments.append({
+                "page": next_q_page,
+                "rect": fitz.Rect(safe_x0, 40, safe_x1, next_q_y)
+            })
 
+        # Render & Stitch
         images = []
         total_h = 0
         max_w = 0
         
-        for p_idx_s, y_s, y_e in pages_to_process:
-            if y_e <= y_s: continue
-            
-            page = doc[p_idx_s]
-            rect = fitz.Rect(0, y_s, page.rect.width, y_e)
-            pix = page.get_pixmap(dpi=200, clip=rect)
+        for seg in segments:
+            page = doc[seg['page']]
+            # Use clip=rect for precise cropping
+            pix = page.get_pixmap(dpi=200, clip=seg['rect'])
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            
             images.append(img)
             total_h += img.height
             max_w = max(max_w, img.width)
@@ -310,6 +327,7 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         final_img = Image.new('RGB', (max_w, total_h), (255, 255, 255))
         current_y = 0
         for img in images:
+            # Center or Left Align? Left align preserves column structure usually
             final_img.paste(img, (0, current_y))
             current_y += img.height
         
@@ -337,10 +355,8 @@ def worker_process(job_id, pdf_path, job_dir):
         total_pages = len(doc)
         FULL_VISION_DATA = {}
         
-        # --- PARALLEL BATCH PROCESSING ---
         BATCH_SIZE = 4 
         batches = []
-        
         for i in range(0, total_pages, BATCH_SIZE):
             indices = list(range(i, min(i + BATCH_SIZE, total_pages)))
             batches.append(indices)
@@ -361,14 +377,12 @@ def worker_process(job_id, pdf_path, job_dir):
                         q_nums = [x['q'] for x in v]
                         log_job(job_id, f"   -> Page {k+1}: Found Qs {q_nums}", "INFO")
 
-        # PHASE 2: CROP
-        log_job(job_id, "✂️ Cropping using Groq's Exact Coordinates...", "INFO")
+        log_job(job_id, "✂️ Cropping using Groq's Bounding Boxes...", "INFO")
         final_qs = extract_and_stitch_pure_vision(job_id, doc, FULL_VISION_DATA, export_dir)
         
         if not final_qs:
             raise Exception("AI found no valid questions.")
             
-        # PHASE 3: JSON & ZIP
         log_job(job_id, "📦 Generating Data Package...", "INFO")
         
         data_json = {
@@ -458,7 +472,7 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Parallel Vision Mode) 🚀"
+    return "Team Stark V33 (Parallel Bounding Boxes) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
