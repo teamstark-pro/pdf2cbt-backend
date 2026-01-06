@@ -29,7 +29,14 @@ CORS(app, resources={r"/*": {"origins": "*"}},
 BASE_TEMP_DIR = "/tmp/stark_processor"
 os.makedirs(BASE_TEMP_DIR, exist_ok=True)
 
-# --- IMPROVED LOGGING FOR RAILWAY ---
+# --- SYSTEM LIMITS ---
+MAX_CONCURRENT_JOBS = 3
+MAX_PAGES_PER_PDF = 20
+
+# Semaphore to control active jobs (Queue System)
+job_semaphore = threading.Semaphore(MAX_CONCURRENT_JOBS)
+
+# --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("StarkLogger")
 
@@ -61,18 +68,15 @@ class SmartGroqManager:
         available_keys = [k for k in self.all_keys if now >= self.key_cooldowns[k]]
         
         if not available_keys:
-            selected_key = min(self.key_cooldowns, key=self.key_cooldowns.get)
-            wait_time = max(0, self.key_cooldowns[selected_key] - now)
-            if wait_time > 0:
-                print(f"[SYSTEM] ⏳ Keys busy. Sleeping {wait_time:.1f}s...", flush=True)
-                time.sleep(wait_time)
+            selected_key = random.choice(self.all_keys)
         else:
             selected_key = random.choice(available_keys)
+            
         return Groq(api_key=selected_key), selected_key
 
     def mark_rate_limited(self, key):
-        self.key_cooldowns[key] = time.time() + 10 # Short cooldown since user says limits aren't issue
-        print(f"[SYSTEM] ⚠️ Rate limit on key ...{key[-4:]}. Cooldown 10s.", flush=True)
+        self.key_cooldowns[key] = time.time() + 5
+        print(f"[SYSTEM] ⚠️ Rate limit on key ...{key[-4:]}. Pausing it for 5s.", flush=True)
 
     def call_vision_batch(self, message_payload, retries=5):
         for attempt in range(retries):
@@ -88,7 +92,7 @@ class SmartGroqManager:
                 return json.loads(completion.choices[0].message.content)
             except RateLimitError:
                 self.mark_rate_limited(key_used)
-                time.sleep(1) 
+                time.sleep(0.5) 
             except BadRequestError as e:
                 if "decommissioned" in str(e).lower():
                      log_job("SYSTEM", f"🔥 FATAL: Model {CURRENT_VISION_MODEL} decommissioned.", "ERROR")
@@ -97,7 +101,7 @@ class SmartGroqManager:
                 break
             except Exception as e:
                 log_job("SYSTEM", f"❌ Groq Error: {str(e)}", "ERROR")
-                time.sleep(1)
+                time.sleep(0.5)
         return None
 
 groq_manager = SmartGroqManager()
@@ -126,8 +130,8 @@ def pixmap_to_base64(pix):
 
 def get_questions_ai_coordinates(job_id, doc, page_indices):
     """
-    Asks Groq for EXACT BOUNDING BOX (X and Y).
-    Scale: 0-1000.
+    UNIVERSAL COORDINATE DETECTION.
+    Asks Groq to detect layout automatically (Single vs Double Column).
     """
     payload_content = [
         {
@@ -136,34 +140,29 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
             Analyze these exam pages.
             
             TASK:
-            Identify the FULL BOUNDING BOX for every question.
+            Identify the FULL BOUNDING BOX for every question block found.
             
-            CRITICAL REQUIREMENT:
-            - The box MUST start at the Question Number.
-            - The box MUST extend downwards to include ALL OPTIONS (A, B, C, D).
-            - Do not stop at the question text; include the answers/choices below it.
+            UNIVERSAL LAYOUT RULES:
+            1. Detect if the page is Single Column or Double Column automatically based on visual appearance.
+            2. Start the box at the Question Number.
+            3. Extend the box downwards to include ALL options (A, B, C, D) or the answer block.
+            4. **CRITICAL: WIDTH DETECTION**
+               - If the text spans the full page width (Single Column), set x_end near 1000.
+               - If the text is in a column, set x_end at the end of that column's text.
+               - Do NOT cut off the text horizontally. Capture the full width of the question line.
             
             OUTPUT RULES:
-            Return a JSON object with keys like "img_0".
-            Value is a LIST of objects:
+            Return JSON. Key: "img_0", Value: LIST of objects:
             {
-               "q_num": Integer (Question Number),
+               "q_num": Integer,
                "x_start": Integer (0-1000),
                "y_start": Integer (0-1000),
-               "x_end": Integer (0-1000),
-               "y_end": Integer (0-1000) - MUST be below the last option (D).
+               "x_end": Integer (0-1000) - Make sure this covers the full text width.
+               "y_end": Integer (0-1000) - Must be below the last option.
             }
             
-            IMPORTANT:
-            - If Q1 is in Col A, x_end should be ~480.
-            - If Q6 is in Col B, x_start should be ~520.
+            MULTI-PAGE RULE:
             - If a question continues to the next page, set "y_end" to 1000.
-            
-            EXAMPLE:
-            { "img_0": [ 
-               {"q_num": 1, "x_start": 50, "y_start": 50, "x_end": 450, "y_end": 400}, 
-               {"q_num": 2, "x_start": 500, "y_start": 50, "x_end": 950, "y_end": 350} 
-            ] }
             """
         }
     ]
@@ -200,15 +199,13 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                     for item in item_list:
                         try:
                             q_num = int(str(item.get("q_num", "")).strip())
-                            
-                            # Parse all 4 coordinates
                             x0 = int(str(item.get("x_start", "0")).strip())
                             y0 = int(str(item.get("y_start", "0")).strip())
                             x1 = int(str(item.get("x_end", "1000")).strip())
                             y1 = int(str(item.get("y_end", "1000")).strip())
                             
-                            # Basic Validation
-                            if x1 <= x0: x1 = x0 + 100
+                            # Universal Safety Fixes
+                            if x1 <= x0: x1 = 1000 # If width is invalid, assume full width
                             if y1 <= y0: y1 = y0 + 100
                             
                             cleaned_items.append({
@@ -218,7 +215,6 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                             })
                         except: pass
                 
-                # Sort by Y position mainly, then X
                 cleaned_items.sort(key=lambda x: (x["y0"], x["x0"]))
                 result_map[real_page_idx] = cleaned_items
                 
@@ -233,7 +229,6 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         h = page.rect.height
         
         for item in items:
-            # Convert 0-1000 scale to actual PDF points
             x0 = (item['x0'] / 1000.0) * w
             y0 = (item['y0'] / 1000.0) * h
             x1 = (item['x1'] / 1000.0) * w
@@ -253,31 +248,25 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
 
     final_output = []
     
-    # --- ZOOM OUT FACTOR (Padding) ---
-    # We add extra pixels to "zoom out" the crop so it's not too tight
+    # Universal Padding
     PAD_Y_TOP = 25  
-    PAD_Y_BOTTOM = 35 # Increased bottom padding to catch options
+    PAD_Y_BOTTOM = 35 
     PAD_X = 20  
     
     for i, q in enumerate(all_qs_coords):
         curr_p = q["page"]
         orig_rect = q["rect"]
         
-        # Apply Zoom Out (Inflation)
         safe_x0 = max(0, orig_rect.x0 - PAD_X)
         safe_y0 = max(0, orig_rect.y0 - PAD_Y_TOP)
         safe_x1 = min(doc[curr_p].rect.width, orig_rect.x1 + PAD_X)
         safe_y1 = min(doc[curr_p].rect.height, orig_rect.y1 + PAD_Y_BOTTOM)
         
-        # Check for Multipage Trailing
         is_multipage = False
         
-        # If AI says it ends extremely close to bottom (>980) 
         if q["raw_y1_score"] >= 980:
              is_multipage = True
-             safe_y1 = doc[curr_p].rect.height - 40 # Margin
-        
-        # Or if next question is on next page, current might be trailing
+             safe_y1 = doc[curr_p].rect.height - 40
         elif i + 1 < len(all_qs_coords):
              next_q = all_qs_coords[i+1]
              if next_q["page"] > curr_p and q["raw_y1_score"] > 900:
@@ -286,42 +275,38 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
 
         segments = []
         
-        # Segment 1: The main box on current page
+        # Segment 1
         segments.append({
             "page": curr_p,
             "rect": fitz.Rect(safe_x0, safe_y0, safe_x1, safe_y1)
         })
         
-        # Segment 2+: Stitching (Next Page)
+        # Segment 2+ (Stitching)
         if is_multipage and i + 1 < len(all_qs_coords):
             next_q = all_qs_coords[i+1]
             next_q_page = next_q["page"]
             
-            # Intermediate pages
             for gap_p in range(curr_p + 1, next_q_page):
+                # Use same width (safe_x0 to safe_x1) for continuity
                 segments.append({
                     "page": gap_p,
                     "rect": fitz.Rect(safe_x0, 40, safe_x1, doc[gap_p].rect.height - 40)
                 })
             
-            # Final part on next page
-            # End Y is where next question starts
-            next_q_y = next_q["rect"].y0 - 20 # Buffer
+            # Next question start y
+            next_q_y = next_q["rect"].y0 - 20
             next_q_y = max(50, next_q_y)
-            
             segments.append({
                 "page": next_q_page,
                 "rect": fitz.Rect(safe_x0, 40, safe_x1, next_q_y)
             })
 
-        # Render & Stitch
         images = []
         total_h = 0
         max_w = 0
         
         for seg in segments:
             page = doc[seg['page']]
-            # Use clip=rect for precise cropping
             pix = page.get_pixmap(dpi=200, clip=seg['rect'])
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             images.append(img)
@@ -349,121 +334,119 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
     return final_output
 
 def worker_process(job_id, pdf_path, job_dir):
-    export_dir = os.path.join(job_dir, "master_package")
-    os.makedirs(export_dir, exist_ok=True)
-    
-    # We need to know total pages first
-    try:
-        temp_doc = fitz.open(pdf_path)
-        total_pages = len(temp_doc)
-        pdf_hash = get_pdf_hash(pdf_path)
-        temp_doc.close()
-    except Exception as e:
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = f"Failed to open PDF: {e}"
-        return
-
-    try:
-        log_job(job_id, "🚀 Starting Process...", "INFO")
+    # CRITICAL: Acquire Semaphore (Wait in Queue if busy)
+    with job_semaphore:
+        export_dir = os.path.join(job_dir, "master_package")
+        os.makedirs(export_dir, exist_ok=True)
         
-        FULL_VISION_DATA = {}
-        
-        BATCH_SIZE = 3 
-        batches = []
-        for i in range(0, total_pages, BATCH_SIZE):
-            indices = list(range(i, min(i + BATCH_SIZE, total_pages)))
-            batches.append(indices)
-            
-        log_job(job_id, f"⚡ Parallel Scanning {len(batches)} batches ({total_pages} pages)...", "INFO")
-
-        def process_batch(indices):
-            # --- THREAD SAFETY FIX ---
-            # Open a NEW handle to the PDF for this thread. 
-            # PyMuPDF Document objects are NOT thread-safe for concurrent methods.
-            thread_doc = fitz.open(pdf_path)
-            try:
-                # Add small random sleep to prevent hitting rate limit instantly
-                time.sleep(random.uniform(0.1, 0.5))
-                result = get_questions_ai_coordinates(job_id, thread_doc, indices)
-                return indices, result
-            finally:
-                thread_doc.close()
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            future_to_batch = {executor.submit(process_batch, b): b for b in batches}
-            
-            for future in concurrent.futures.as_completed(future_to_batch):
-                try:
-                    indices, result = future.result()
-                    if result:
-                        for k, v in result.items():
-                            FULL_VISION_DATA[k] = v
-                            q_nums = [x['q'] for x in v]
-                            log_job(job_id, f"   -> Page {k+1}: Found Qs {q_nums}", "INFO")
-                    else:
-                         log_job(job_id, f"   -> Page Batch {indices} yielded no results.", "WARN")
-                except Exception as e:
-                    log_job(job_id, f"   -> Batch Error: {str(e)}", "ERROR")
-
-        if not FULL_VISION_DATA:
-             raise Exception("Scan completed but no questions were found in any batch.")
-
-        log_job(job_id, "✂️ Cropping with Padding...", "INFO")
-        
-        # Open Main Doc for Cropping (Single Threaded Phase)
-        main_doc = fitz.open(pdf_path)
-        final_qs = extract_and_stitch_pure_vision(job_id, main_doc, FULL_VISION_DATA, export_dir)
-        main_doc.close()
-        
-        if not final_qs:
-            raise Exception("No valid questions generated after cropping.")
-            
-        log_job(job_id, "📦 Generating Data Package...", "INFO")
-        
-        data_json = {
-            "testConfig": {"pdfFileHash": pdf_hash},
-            "pdfCropperData": {"Stark": {"Stark": {}}},
-            "appVersion": "1.30.0",
-            "generatedBy": "Team_Stark_Vision_Mode"
-        }
-        
-        for q in final_qs:
-            key = q['label']
-            if "_" in q['filename']:
-                 try:
-                    key = q['filename'].split("__--__")[1]
-                 except: pass
-
-            data_json["pdfCropperData"]["Stark"]["Stark"][key] = {
-                "que": key,
-                "type": "mcq",
-                "marks": {"cm": 4, "im": -1},
-                "answerOptions": "4",
-                "pdfData": [{"x1": 5, "x2": 995, "y1": 100, "y2": 500, "page": 1}]
-            }
-        
-        with open(os.path.join(export_dir, "data.json"), "w") as f:
-            json.dump(data_json, f, indent=2)
-
-        zip_path = os.path.join(job_dir, f"{job_id}_result.zip")
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, dirs, files in os.walk(export_dir):
-                for file in files:
-                    zipf.write(os.path.join(root, file), file)
-        
-        jobs[job_id]["status"] = "completed"
-        jobs[job_id]["file_path"] = zip_path
-        log_job(job_id, "✅ JOB COMPLETE. Ready for download.", "SUCCESS")
-        
-    except Exception as e:
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = str(e)
-        log_job(job_id, f"🔥 FATAL ERROR: {str(e)}", "ERROR")
-    finally:
         try:
-            shutil.rmtree(export_dir)
-        except: pass
-        gc.collect()
+            # Check Page Limit
+            temp_doc = fitz.open(pdf_path)
+            total_pages = len(temp_doc)
+            if total_pages > MAX_PAGES_PER_PDF:
+                raise Exception(f"PDF too large! Max {MAX_PAGES_PER_PDF} pages allowed.")
+            pdf_hash = get_pdf_hash(pdf_path)
+            temp_doc.close()
+        except Exception as e:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = str(e)
+            return
+
+        try:
+            log_job(job_id, f"🚀 STARTING JOB. Pages: {total_pages}", "INFO")
+            
+            FULL_VISION_DATA = {}
+            BATCH_SIZE = 4 
+            batches = []
+            for i in range(0, total_pages, BATCH_SIZE):
+                indices = list(range(i, min(i + BATCH_SIZE, total_pages)))
+                batches.append(indices)
+                
+            log_job(job_id, f"⚡ Scanning {len(batches)} batches...", "INFO")
+
+            def process_batch(indices):
+                thread_doc = fitz.open(pdf_path)
+                try:
+                    time.sleep(random.uniform(0.1, 0.5))
+                    result = get_questions_ai_coordinates(job_id, thread_doc, indices)
+                    return indices, result
+                finally:
+                    thread_doc.close()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_batch = {executor.submit(process_batch, b): b for b in batches}
+                
+                for future in concurrent.futures.as_completed(future_to_batch):
+                    try:
+                        indices, result = future.result()
+                        if result:
+                            for k, v in result.items():
+                                FULL_VISION_DATA[k] = v
+                                q_nums = [x['q'] for x in v]
+                                log_job(job_id, f"   -> Page {k+1}: Found Qs {q_nums}", "INFO")
+                        else:
+                             log_job(job_id, f"   -> Batch {indices}: AI found 0 questions.", "WARN")
+                    except Exception as e:
+                        log_job(job_id, f"   -> Batch Error: {str(e)}", "ERROR")
+
+            if not FULL_VISION_DATA:
+                 raise Exception("Scan completed but no questions were found in any batch.")
+
+            log_job(job_id, "✂️ Universal Cropping...", "INFO")
+            
+            main_doc = fitz.open(pdf_path)
+            final_qs = extract_and_stitch_pure_vision(job_id, main_doc, FULL_VISION_DATA, export_dir)
+            main_doc.close()
+            
+            if not final_qs:
+                raise Exception("No valid questions generated after cropping.")
+                
+            log_job(job_id, "📦 Generating Data Package...", "INFO")
+            
+            data_json = {
+                "testConfig": {"pdfFileHash": pdf_hash},
+                "pdfCropperData": {"Stark": {"Stark": {}}},
+                "appVersion": "1.30.0",
+                "generatedBy": "Team_Stark_Universal_V4"
+            }
+            
+            for q in final_qs:
+                key = q['label']
+                if "_" in q['filename']:
+                     try:
+                        key = q['filename'].split("__--__")[1]
+                     except: pass
+
+                data_json["pdfCropperData"]["Stark"]["Stark"][key] = {
+                    "que": key,
+                    "type": "mcq",
+                    "marks": {"cm": 4, "im": -1},
+                    "answerOptions": "4",
+                    "pdfData": [{"x1": 5, "x2": 995, "y1": 100, "y2": 500, "page": 1}]
+                }
+            
+            with open(os.path.join(export_dir, "data.json"), "w") as f:
+                json.dump(data_json, f, indent=2)
+
+            zip_path = os.path.join(job_dir, f"{job_id}_result.zip")
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files in os.walk(export_dir):
+                    for file in files:
+                        zipf.write(os.path.join(root, file), file)
+            
+            jobs[job_id]["status"] = "completed"
+            jobs[job_id]["file_path"] = zip_path
+            log_job(job_id, "✅ JOB COMPLETE. Ready for download.", "SUCCESS")
+            
+        except Exception as e:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = str(e)
+            log_job(job_id, f"🔥 FATAL ERROR: {str(e)}", "ERROR")
+        finally:
+            try:
+                shutil.rmtree(export_dir)
+            except: pass
+            gc.collect()
 
 # --- API ROUTES ---
 
@@ -481,13 +464,14 @@ def start_job():
     save_path = os.path.join(job_dir, "source.pdf")
     file.save(save_path)
     
-    jobs[job_id] = {"status": "processing", "logs": [], "file_path": None, "error": None}
+    jobs[job_id] = {"status": "queued", "logs": [], "file_path": None, "error": None}
     
+    # Spawn thread (It will wait at the Semaphore if busy)
     thread = threading.Thread(target=worker_process, args=(job_id, save_path, job_dir))
     thread.daemon = True
     thread.start()
     
-    return jsonify({"job_id": job_id, "message": "Job started"})
+    return jsonify({"job_id": job_id, "message": "Job queued/started"})
 
 @app.route('/status/<job_id>', methods=['GET'])
 def get_status(job_id):
@@ -506,7 +490,7 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Thread-Safe + Full Options) 🚀"
+    return "Team Stark V33 (Universal + Queue) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
