@@ -59,6 +59,8 @@ class SmartGroqManager:
         if not self.all_keys: return None, None
         now = time.time()
         available_keys = [k for k in self.all_keys if now >= self.key_cooldowns[k]]
+        
+        # If no keys available, wait for the soonest one
         if not available_keys:
             selected_key = min(self.key_cooldowns, key=self.key_cooldowns.get)
             wait_time = max(0, self.key_cooldowns[selected_key] - now)
@@ -70,8 +72,9 @@ class SmartGroqManager:
         return Groq(api_key=selected_key), selected_key
 
     def mark_rate_limited(self, key):
-        self.key_cooldowns[key] = time.time() + 20
-        print(f"[SYSTEM] ⚠️ Rate limit on key ...{key[-4:]}. Cooldown 20s.", flush=True)
+        # Increased cooldown to be safer
+        self.key_cooldowns[key] = time.time() + 30 
+        print(f"[SYSTEM] ⚠️ Rate limit on key ...{key[-4:]}. Cooldown 30s.", flush=True)
 
     def call_vision_batch(self, message_payload, retries=5):
         for attempt in range(retries):
@@ -87,7 +90,7 @@ class SmartGroqManager:
                 return json.loads(completion.choices[0].message.content)
             except RateLimitError:
                 self.mark_rate_limited(key_used)
-                time.sleep(1)
+                time.sleep(2) # Wait a bit longer before retry
             except BadRequestError as e:
                 if "decommissioned" in str(e).lower():
                      log_job("SYSTEM", f"🔥 FATAL: Model {CURRENT_VISION_MODEL} decommissioned.", "ERROR")
@@ -135,7 +138,7 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
             Analyze these exam pages.
             
             TASK:
-            Identify the EXACT bounding box for every question (including its options).
+            Identify the BOUNDING BOX for every question (including its options).
             
             OUTPUT RULES:
             Return a JSON object with keys like "img_0".
@@ -149,8 +152,9 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
             }
             
             IMPORTANT:
-            - Handle MULTI-COLUMN layouts correctly. If Q1 is in Col A, x_end should be ~480. If Q6 is in Col B, x_start should be ~520.
-            - "y_end" must include all options (A, B, C, D).
+            - Capture the WHOLE block including options A, B, C, D.
+            - If Q1 is in Col A, x_end should be ~480.
+            - If Q6 is in Col B, x_start should be ~520.
             - If a question continues to the next page, set "y_end" to 1000.
             
             EXAMPLE:
@@ -201,7 +205,7 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                             x1 = int(str(item.get("x_end", "1000")).strip())
                             y1 = int(str(item.get("y_end", "1000")).strip())
                             
-                            # Sanity Checks
+                            # Basic Validation
                             if x1 <= x0: x1 = x0 + 100
                             if y1 <= y0: y1 = y0 + 100
                             
@@ -212,7 +216,7 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                             })
                         except: pass
                 
-                # Sort by Y position mainly
+                # Sort by Y position mainly, then X
                 cleaned_items.sort(key=lambda x: (x["y0"], x["x0"]))
                 result_map[real_page_idx] = cleaned_items
                 
@@ -237,7 +241,7 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
                 "label": str(item['q']),
                 "page": p_idx,
                 "rect": fitz.Rect(x0, y0, x1, y1),
-                "raw_y1_score": item['y1'] # Check for page trailing
+                "raw_y1_score": item['y1']
             })
 
     all_qs_coords.sort(key=lambda x: (x["page"], x["rect"].y0))
@@ -247,31 +251,32 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
 
     final_output = []
     
-    PAD_Y = 15  # Buffer top/bottom
-    PAD_X = 10  # Buffer left/right
+    # --- ZOOM OUT FACTOR (Padding) ---
+    # We add extra pixels to "zoom out" the crop so it's not too tight
+    PAD_Y = 30  # Increased padding for vertical (was 15)
+    PAD_X = 20  # Increased padding for horizontal (was 10)
     
     for i, q in enumerate(all_qs_coords):
         curr_p = q["page"]
         orig_rect = q["rect"]
         
-        # Apply padding (Buffer)
-        # Ensure we don't go out of page bounds
+        # Apply Zoom Out (Inflation)
         safe_x0 = max(0, orig_rect.x0 - PAD_X)
         safe_y0 = max(0, orig_rect.y0 - PAD_Y)
         safe_x1 = min(doc[curr_p].rect.width, orig_rect.x1 + PAD_X)
         safe_y1 = min(doc[curr_p].rect.height, orig_rect.y1 + PAD_Y)
         
         # Check for Multipage Trailing
-        # If AI says it ends at bottom (>980) OR next question is on next page
         is_multipage = False
         
+        # If AI says it ends extremely close to bottom (>980) 
         if q["raw_y1_score"] >= 980:
              is_multipage = True
              safe_y1 = doc[curr_p].rect.height - 40 # Margin
+        
+        # Or if next question is on next page, current might be trailing
         elif i + 1 < len(all_qs_coords):
              next_q = all_qs_coords[i+1]
-             # logic: if next Q is on next page, current MIGHT be trailing
-             # BUT only if current Y end is close to bottom
              if next_q["page"] > curr_p and q["raw_y1_score"] > 900:
                  is_multipage = True
                  safe_y1 = doc[curr_p].rect.height - 40
@@ -289,18 +294,16 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
             next_q = all_qs_coords[i+1]
             next_q_page = next_q["page"]
             
-            # If gap between pages, grab full intermediate pages
-            # BUT restrict width to the original column width (safe_x0, safe_x1)
+            # Intermediate pages
             for gap_p in range(curr_p + 1, next_q_page):
                 segments.append({
                     "page": gap_p,
                     "rect": fitz.Rect(safe_x0, 40, safe_x1, doc[gap_p].rect.height - 40)
                 })
             
-            # Final part on next page (until next Q starts)
-            # We assume the column layout persists
+            # Final part on next page
             # End Y is where next question starts
-            next_q_y = next_q["rect"].y0 - 15
+            next_q_y = next_q["rect"].y0 - 20 # Buffer
             next_q_y = max(50, next_q_y)
             
             segments.append({
@@ -327,7 +330,6 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         final_img = Image.new('RGB', (max_w, total_h), (255, 255, 255))
         current_y = 0
         for img in images:
-            # Center or Left Align? Left align preserves column structure usually
             final_img.paste(img, (0, current_y))
             current_y += img.height
         
@@ -355,33 +357,45 @@ def worker_process(job_id, pdf_path, job_dir):
         total_pages = len(doc)
         FULL_VISION_DATA = {}
         
-        BATCH_SIZE = 4 
+        # Reduced batch size slightly to improve reliability
+        BATCH_SIZE = 3 
         batches = []
         for i in range(0, total_pages, BATCH_SIZE):
             indices = list(range(i, min(i + BATCH_SIZE, total_pages)))
             batches.append(indices)
             
-        log_job(job_id, f"⚡ Parallel Scanning {len(batches)} batches...", "INFO")
+        log_job(job_id, f"⚡ Parallel Scanning {len(batches)} batches ({total_pages} pages)...", "INFO")
 
         def process_batch(indices):
+            # Add small random sleep to prevent hitting rate limit instantly
+            time.sleep(random.uniform(0.1, 1.0))
             return indices, get_questions_ai_coordinates(job_id, doc, indices)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # Reduced max_workers to 4 to prevent "One Page Scan" issue due to blocking
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             future_to_batch = {executor.submit(process_batch, b): b for b in batches}
             
             for future in concurrent.futures.as_completed(future_to_batch):
-                indices, result = future.result()
-                if result:
-                    for k, v in result.items():
-                        FULL_VISION_DATA[k] = v
-                        q_nums = [x['q'] for x in v]
-                        log_job(job_id, f"   -> Page {k+1}: Found Qs {q_nums}", "INFO")
+                try:
+                    indices, result = future.result()
+                    if result:
+                        for k, v in result.items():
+                            FULL_VISION_DATA[k] = v
+                            q_nums = [x['q'] for x in v]
+                            log_job(job_id, f"   -> Page {k+1}: Found Qs {q_nums}", "INFO")
+                    else:
+                         log_job(job_id, f"   -> Page Batch {indices} yielded no results.", "WARN")
+                except Exception as e:
+                    log_job(job_id, f"   -> Batch Error: {str(e)}", "ERROR")
 
-        log_job(job_id, "✂️ Cropping using Groq's Bounding Boxes...", "INFO")
+        if not FULL_VISION_DATA:
+             raise Exception("Scan completed but no questions were found in any batch.")
+
+        log_job(job_id, "✂️ Cropping with Padding...", "INFO")
         final_qs = extract_and_stitch_pure_vision(job_id, doc, FULL_VISION_DATA, export_dir)
         
         if not final_qs:
-            raise Exception("AI found no valid questions.")
+            raise Exception("No valid questions generated after cropping.")
             
         log_job(job_id, "📦 Generating Data Package...", "INFO")
         
@@ -472,7 +486,7 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Parallel Bounding Boxes) 🚀"
+    return "Team Stark V33 (Padded Crops + Safe Batching) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
