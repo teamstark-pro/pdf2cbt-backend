@@ -124,30 +124,21 @@ def pixmap_to_base64(pix):
     except Exception as e: return ""
 
 # ==========================================
-# STRATEGY 1: REGEX (Text Layer Analysis)
+# STRATEGY 1: REGEX (With Strict Validation)
 # ==========================================
 
 def find_questions_via_regex(doc, pdf_type):
-    """
-    Scans the PDF text layer using Regex.
-    Returns a list of Question Blocks with precise coordinates.
-    """
     questions = []
-    
-    # Regex Patterns
     patterns = [
         r"^\s*(\d+)[\.\)\-\:]",           # 1. or 1) or 1-
         r"^\s*Q(?:uestion)?[\.\s]*(\d+)", # Q.1 or Question 1
         r"^\s*\((\d+)\)"                  # (1)
     ]
-    
     bad_keywords = ["Solution", "Answer", "Exp:", "Explanation", "Page", "Fig", "Table"]
-    total_pages = len(doc)
     
-    for p_idx in range(total_pages):
+    for p_idx in range(len(doc)):
         page = doc[p_idx]
         width = page.rect.width
-        
         blocks = page.get_text("blocks")
         
         # Layout Sorting
@@ -166,34 +157,51 @@ def find_questions_via_regex(doc, pdf_type):
             if not text: continue
             if any(bk in text for bk in bad_keywords): continue
             
-            is_match = False
-            q_num = -1
-            
             for pat in patterns:
                 match = re.search(pat, text, re.IGNORECASE)
                 if match:
                     try:
                         q_num = int(match.group(1))
-                        if q_num > 1000: continue 
-                        is_match = True
+                        # Basic Sanity: No huge numbers (e.g. year 2024) unless it's reasonable
+                        if q_num > 500 and len(questions) < 10: continue 
+                        questions.append({
+                            "q_num": q_num,
+                            "page": p_idx,
+                            "rect": fitz.Rect(b[0], b[1], b[2], b[3])
+                        })
                         break
                     except: pass
-            
-            if is_match:
-                questions.append({
-                    "q_num": q_num,
-                    "page": p_idx,
-                    "rect": fitz.Rect(b[0], b[1], b[2], b[3]),
-                    "raw_text": text[:20] + "..."
-                })
 
+    # --- VALIDATION LAYER ---
+    if not questions: return []
+    
     questions.sort(key=lambda x: x["q_num"])
-    return questions
+    
+    # Check Sequence Quality
+    # If we have [1, 2, 50, 100, 3] -> That's bad.
+    # We want roughly [1, 2, 3, 4, 5...]
+    
+    valid_qs = []
+    last_q = 0
+    strikes = 0
+    
+    for q in questions:
+        # Allow gaps (e.g. 1 -> 2 -> 4 is okay, maybe 3 was missed)
+        # But 1 -> 50 is suspicious
+        if q["q_num"] <= last_q: continue # Duplicate or out of order
+        if q["q_num"] > last_q + 10: 
+            strikes += 1
+        
+        valid_qs.append(q)
+        last_q = q["q_num"]
+        
+    # If too many large gaps, the text layer is likely broken/garbage
+    if strikes > 3:
+        return None # Signal to switch to AI
+        
+    return valid_qs
 
 def crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type):
-    """
-    Precision cropping based on Text Layer Coordinates.
-    """
     final_output = []
     PAD_TOP = 15
     PAD_BOTTOM = 10
@@ -207,7 +215,6 @@ def crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type):
         if i + 1 < len(questions):
             next_q = questions[i+1]
             if next_q["page"] == curr_p:
-                # Same Page Logic
                 if pdf_type == 'double_col':
                     curr_is_left = q["rect"].x0 < (doc[curr_p].rect.width / 2)
                     next_is_left = next_q["rect"].x0 < (doc[curr_p].rect.width / 2)
@@ -223,7 +230,6 @@ def crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type):
         else:
             y_end = doc[curr_p].rect.height - 40
 
-        # Define Crop Width
         page_width = doc[curr_p].rect.width
         if pdf_type == 'double_col':
             if q["rect"].x0 < (page_width / 2):
@@ -233,13 +239,11 @@ def crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type):
         else:
             x_start, x_end = 0, page_width
 
-        segments = []
-        segments.append({"page": curr_p, "rect": fitz.Rect(x_start, y_start, x_end, y_end)})
+        segments = [{"page": curr_p, "rect": fitz.Rect(x_start, y_start, x_end, y_end)}]
         
         if is_multipage and i + 1 < len(questions):
             next_q = questions[i+1]
             next_p = next_q["page"]
-            
             if pdf_type == 'double_col':
                  if next_q["rect"].x0 < (doc[next_p].rect.width / 2):
                      nx_start, nx_end = 0, (doc[next_p].rect.width / 2)
@@ -254,7 +258,6 @@ def crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type):
         images = []
         total_h = 0
         max_w = 0
-        
         for seg in segments:
             page = doc[seg['page']]
             clip_rect = seg['rect'] & page.rect
@@ -268,7 +271,6 @@ def crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type):
             except: pass
             
         if not images: continue
-        
         final_img = Image.new('RGB', (max_w, total_h), (255, 255, 255))
         cy = 0
         for img in images:
@@ -280,7 +282,6 @@ def crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type):
         if os.path.exists(fpath):
             fname = f"Stark__--__{q['q_num']}_{uuid.uuid4().hex[:4]}__--__1.png"
             fpath = os.path.join(export_dir, fname)
-            
         final_img.save(fpath)
         final_output.append({"label": str(q['q_num']), "filename": fname})
         
@@ -415,8 +416,7 @@ def extract_and_stitch_vision(job_id, doc, vision_map, export_dir, pdf_type):
                  is_multipage = True
                  safe_y1 = doc[curr_p].rect.height - 40
 
-        segments = []
-        segments.append({"page": curr_p, "rect": fitz.Rect(safe_x0, safe_y0, safe_x1, safe_y1)})
+        segments = [{"page": curr_p, "rect": fitz.Rect(safe_x0, safe_y0, safe_x1, safe_y1)}]
         
         if is_multipage and i + 1 < len(all_qs_coords):
             next_q = all_qs_coords[i+1]
@@ -479,20 +479,21 @@ def worker_process(job_id, pdf_path, job_dir, pdf_type):
             log_job(job_id, "🔍 Strategy 1: Text Layer Scan...", "INFO")
             questions = find_questions_via_regex(doc, pdf_type)
             
-            if questions:
-                log_job(job_id, f"✅ Text Layer found {len(questions)} items. Processing...", "SUCCESS")
+            # Smart Validation: If Regex returns junk or nothing, fallback.
+            if questions and len(questions) > 0:
+                log_job(job_id, f"✅ Regex valid. Found {len(questions)} items.", "SUCCESS")
                 final_qs = crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type)
             
             # --- ATTEMPT 2: VISION AI (Fallback) ---
-            else:
-                log_job(job_id, "⚠️ No Text Layer found. Switching to Vision AI...", "WARN")
+            if not final_qs:
+                log_job(job_id, "⚠️ Regex failed (Bad Text Layer). Switching to Vision AI...", "WARN")
                 FULL_VISION_DATA = {}
                 BATCH_SIZE = 2
                 batches = [list(range(i, min(i + BATCH_SIZE, len(doc)))) for i in range(0, len(doc), BATCH_SIZE)]
                 
                 for indices in batches:
                     log_job(job_id, f"   -> AI Scanning Pages {[p+1 for p in indices]}...", "INFO")
-                    batch_doc = fitz.open(pdf_path) # Fresh handle for memory safety
+                    batch_doc = fitz.open(pdf_path) # Fresh handle
                     try:
                         result = get_questions_ai_coordinates(job_id, batch_doc, indices, pdf_type)
                         if result:
@@ -507,7 +508,6 @@ def worker_process(job_id, pdf_path, job_dir, pdf_type):
                 
                 if FULL_VISION_DATA:
                     log_job(job_id, "✂️ Vision Cropping...", "INFO")
-                    # Re-open doc for final cropping phase
                     main_doc = fitz.open(pdf_path)
                     final_qs = extract_and_stitch_vision(job_id, main_doc, FULL_VISION_DATA, export_dir, pdf_type)
                     main_doc.close()
@@ -605,4 +605,3 @@ def home():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, threaded=True)
-     
