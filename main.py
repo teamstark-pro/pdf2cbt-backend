@@ -12,7 +12,6 @@ import random
 import re
 import gc
 import zipfile
-import concurrent.futures
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 import fitz  # PyMuPDF
@@ -92,7 +91,7 @@ class SmartGroqManager:
                 return json.loads(completion.choices[0].message.content)
             except RateLimitError:
                 self.mark_rate_limited(key_used)
-                time.sleep(0.5) 
+                time.sleep(1) 
             except BadRequestError as e:
                 if "decommissioned" in str(e).lower():
                      log_job("SYSTEM", f"🔥 FATAL: Model {CURRENT_VISION_MODEL} decommissioned.", "ERROR")
@@ -101,7 +100,7 @@ class SmartGroqManager:
                 break
             except Exception as e:
                 log_job("SYSTEM", f"❌ Groq Error: {str(e)}", "ERROR")
-                time.sleep(0.5)
+                time.sleep(1)
         return None
 
 groq_manager = SmartGroqManager()
@@ -130,8 +129,7 @@ def pixmap_to_base64(pix):
 
 def get_questions_ai_coordinates(job_id, doc, page_indices):
     """
-    UNIVERSAL COORDINATE DETECTION.
-    Asks Groq to detect layout automatically (Single vs Double Column).
+    UNIVERSAL COORDINATE DETECTION (SEQUENTIAL MODE)
     """
     payload_content = [
         {
@@ -142,14 +140,13 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
             TASK:
             Identify the FULL BOUNDING BOX for every question block found.
             
-            UNIVERSAL LAYOUT RULES:
-            1. Detect if the page is Single Column or Double Column automatically based on visual appearance.
-            2. Start the box at the Question Number.
-            3. Extend the box downwards to include ALL options (A, B, C, D) or the answer block.
-            4. **CRITICAL: WIDTH DETECTION**
-               - If the text spans the full page width (Single Column), set x_end near 1000.
-               - If the text is in a column, set x_end at the end of that column's text.
-               - Do NOT cut off the text horizontally. Capture the full width of the question line.
+            UNIVERSAL LAYOUT INSTRUCTIONS:
+            1. **BE GENEROUS**: It is better to include extra whitespace than to cut off text.
+            2. **Start** at the Question Number.
+            3. **End** below the last option (A, B, C, D) or Answer block.
+            4. **WIDTH**:
+               - If the text looks like it spans the whole page, set x_start near 0 and x_end near 1000.
+               - If it is in a column, capture the FULL column width.
             
             OUTPUT RULES:
             Return JSON. Key: "img_0", Value: LIST of objects:
@@ -157,8 +154,8 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                "q_num": Integer,
                "x_start": Integer (0-1000),
                "y_start": Integer (0-1000),
-               "x_end": Integer (0-1000) - Make sure this covers the full text width.
-               "y_end": Integer (0-1000) - Must be below the last option.
+               "x_end": Integer (0-1000),
+               "y_end": Integer (0-1000)
             }
             
             MULTI-PAGE RULE:
@@ -204,8 +201,8 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                             x1 = int(str(item.get("x_end", "1000")).strip())
                             y1 = int(str(item.get("y_end", "1000")).strip())
                             
-                            # Universal Safety Fixes
-                            if x1 <= x0: x1 = 1000 # If width is invalid, assume full width
+                            # Safety Fixes for coordinate inversion
+                            if x1 <= x0: x1 = 1000
                             if y1 <= y0: y1 = y0 + 100
                             
                             cleaned_items.append({
@@ -229,6 +226,19 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         h = page.rect.height
         
         for item in items:
+            # UNIVERSAL SNAP-TO-EDGE LOGIC
+            # If AI says we are close to the edge, Snap to the edge.
+            # This fixes "Single Column" cutoffs perfectly.
+            
+            # Snap X-Start
+            if item['x0'] < 100: 
+                item['x0'] = 0
+            
+            # Snap X-End
+            if item['x1'] > 900: 
+                item['x1'] = 1000
+            
+            # Convert 0-1000 scale to actual PDF points
             x0 = (item['x0'] / 1000.0) * w
             y0 = (item['y0'] / 1000.0) * h
             x1 = (item['x1'] / 1000.0) * w
@@ -248,10 +258,10 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
 
     final_output = []
     
-    # Universal Padding
-    PAD_Y_TOP = 25  
-    PAD_Y_BOTTOM = 35 
-    PAD_X = 20  
+    # GENERALLY INCREASED PADDING TO BE SAFE
+    PAD_Y_TOP = 40  
+    PAD_Y_BOTTOM = 50 
+    PAD_X = 30  
     
     for i, q in enumerate(all_qs_coords):
         curr_p = q["page"]
@@ -287,13 +297,11 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
             next_q_page = next_q["page"]
             
             for gap_p in range(curr_p + 1, next_q_page):
-                # Use same width (safe_x0 to safe_x1) for continuity
                 segments.append({
                     "page": gap_p,
                     "rect": fitz.Rect(safe_x0, 40, safe_x1, doc[gap_p].rect.height - 40)
                 })
             
-            # Next question start y
             next_q_y = next_q["rect"].y0 - 20
             next_q_y = max(50, next_q_y)
             segments.append({
@@ -340,7 +348,6 @@ def worker_process(job_id, pdf_path, job_dir):
         os.makedirs(export_dir, exist_ok=True)
         
         try:
-            # Check Page Limit
             temp_doc = fitz.open(pdf_path)
             total_pages = len(temp_doc)
             if total_pages > MAX_PAGES_PER_PDF:
@@ -353,7 +360,7 @@ def worker_process(job_id, pdf_path, job_dir):
             return
 
         try:
-            log_job(job_id, f"🚀 STARTING JOB. Pages: {total_pages}", "INFO")
+            log_job(job_id, f"🚀 STARTING JOB (Sequential). Pages: {total_pages}", "INFO")
             
             FULL_VISION_DATA = {}
             BATCH_SIZE = 4 
@@ -362,37 +369,38 @@ def worker_process(job_id, pdf_path, job_dir):
                 indices = list(range(i, min(i + BATCH_SIZE, total_pages)))
                 batches.append(indices)
                 
-            log_job(job_id, f"⚡ Scanning {len(batches)} batches...", "INFO")
+            log_job(job_id, f"⚡ Processing {len(batches)} batches sequentially...", "INFO")
 
-            def process_batch(indices):
-                thread_doc = fitz.open(pdf_path)
-                try:
-                    time.sleep(random.uniform(0.1, 0.5))
-                    result = get_questions_ai_coordinates(job_id, thread_doc, indices)
-                    return indices, result
-                finally:
-                    thread_doc.close()
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                future_to_batch = {executor.submit(process_batch, b): b for b in batches}
+            # --- SEQUENTIAL PROCESSING (NO THREADING) ---
+            # This is simpler and less prone to "race conditions" or "silent failures"
+            
+            for indices in batches:
+                log_job(job_id, f"   -> Scanning Pages {[p+1 for p in indices]}...", "INFO")
                 
-                for future in concurrent.futures.as_completed(future_to_batch):
-                    try:
-                        indices, result = future.result()
-                        if result:
-                            for k, v in result.items():
-                                FULL_VISION_DATA[k] = v
-                                q_nums = [x['q'] for x in v]
-                                log_job(job_id, f"   -> Page {k+1}: Found Qs {q_nums}", "INFO")
-                        else:
-                             log_job(job_id, f"   -> Batch {indices}: AI found 0 questions.", "WARN")
-                    except Exception as e:
-                        log_job(job_id, f"   -> Batch Error: {str(e)}", "ERROR")
+                # Open a FRESH doc handle for every batch to be perfectly safe
+                batch_doc = fitz.open(pdf_path)
+                try:
+                    result = get_questions_ai_coordinates(job_id, batch_doc, indices)
+                    if result:
+                        for k, v in result.items():
+                            FULL_VISION_DATA[k] = v
+                            q_nums = [x['q'] for x in v]
+                            log_job(job_id, f"      Found Qs: {q_nums}", "INFO")
+                    else:
+                        log_job(job_id, "      No questions found in this batch.", "WARN")
+                    
+                    # Polite sleep to respect Groq
+                    time.sleep(1) 
+                    
+                except Exception as e:
+                    log_job(job_id, f"      Batch Error: {str(e)}", "ERROR")
+                finally:
+                    batch_doc.close()
 
             if not FULL_VISION_DATA:
                  raise Exception("Scan completed but no questions were found in any batch.")
 
-            log_job(job_id, "✂️ Universal Cropping...", "INFO")
+            log_job(job_id, "✂️ Universal Cropping (Snap-to-Edge)...", "INFO")
             
             main_doc = fitz.open(pdf_path)
             final_qs = extract_and_stitch_pure_vision(job_id, main_doc, FULL_VISION_DATA, export_dir)
@@ -407,7 +415,7 @@ def worker_process(job_id, pdf_path, job_dir):
                 "testConfig": {"pdfFileHash": pdf_hash},
                 "pdfCropperData": {"Stark": {"Stark": {}}},
                 "appVersion": "1.30.0",
-                "generatedBy": "Team_Stark_Universal_V4"
+                "generatedBy": "Team_Stark_Universal_V5"
             }
             
             for q in final_qs:
@@ -490,7 +498,7 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Universal + Queue) 🚀"
+    return "Team Stark V33 (Sequential + Snap-to-Edge Universal) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
