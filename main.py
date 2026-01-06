@@ -60,7 +60,6 @@ class SmartGroqManager:
         now = time.time()
         available_keys = [k for k in self.all_keys if now >= self.key_cooldowns[k]]
         
-        # If no keys available, wait for the soonest one
         if not available_keys:
             selected_key = min(self.key_cooldowns, key=self.key_cooldowns.get)
             wait_time = max(0, self.key_cooldowns[selected_key] - now)
@@ -72,9 +71,8 @@ class SmartGroqManager:
         return Groq(api_key=selected_key), selected_key
 
     def mark_rate_limited(self, key):
-        # Increased cooldown to be safer
-        self.key_cooldowns[key] = time.time() + 30 
-        print(f"[SYSTEM] ⚠️ Rate limit on key ...{key[-4:]}. Cooldown 30s.", flush=True)
+        self.key_cooldowns[key] = time.time() + 10 # Short cooldown since user says limits aren't issue
+        print(f"[SYSTEM] ⚠️ Rate limit on key ...{key[-4:]}. Cooldown 10s.", flush=True)
 
     def call_vision_batch(self, message_payload, retries=5):
         for attempt in range(retries):
@@ -90,7 +88,7 @@ class SmartGroqManager:
                 return json.loads(completion.choices[0].message.content)
             except RateLimitError:
                 self.mark_rate_limited(key_used)
-                time.sleep(2) # Wait a bit longer before retry
+                time.sleep(1) 
             except BadRequestError as e:
                 if "decommissioned" in str(e).lower():
                      log_job("SYSTEM", f"🔥 FATAL: Model {CURRENT_VISION_MODEL} decommissioned.", "ERROR")
@@ -138,21 +136,25 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
             Analyze these exam pages.
             
             TASK:
-            Identify the BOUNDING BOX for every question (including its options).
+            Identify the FULL BOUNDING BOX for every question.
+            
+            CRITICAL REQUIREMENT:
+            - The box MUST start at the Question Number.
+            - The box MUST extend downwards to include ALL OPTIONS (A, B, C, D).
+            - Do not stop at the question text; include the answers/choices below it.
             
             OUTPUT RULES:
             Return a JSON object with keys like "img_0".
             Value is a LIST of objects:
             {
                "q_num": Integer (Question Number),
-               "x_start": Integer (0-1000) - Left edge.
-               "y_start": Integer (0-1000) - Top edge.
-               "x_end": Integer (0-1000) - Right edge.
-               "y_end": Integer (0-1000) - Bottom edge (end of options).
+               "x_start": Integer (0-1000),
+               "y_start": Integer (0-1000),
+               "x_end": Integer (0-1000),
+               "y_end": Integer (0-1000) - MUST be below the last option (D).
             }
             
             IMPORTANT:
-            - Capture the WHOLE block including options A, B, C, D.
             - If Q1 is in Col A, x_end should be ~480.
             - If Q6 is in Col B, x_start should be ~520.
             - If a question continues to the next page, set "y_end" to 1000.
@@ -253,8 +255,9 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
     
     # --- ZOOM OUT FACTOR (Padding) ---
     # We add extra pixels to "zoom out" the crop so it's not too tight
-    PAD_Y = 30  # Increased padding for vertical (was 15)
-    PAD_X = 20  # Increased padding for horizontal (was 10)
+    PAD_Y_TOP = 25  
+    PAD_Y_BOTTOM = 35 # Increased bottom padding to catch options
+    PAD_X = 20  
     
     for i, q in enumerate(all_qs_coords):
         curr_p = q["page"]
@@ -262,9 +265,9 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         
         # Apply Zoom Out (Inflation)
         safe_x0 = max(0, orig_rect.x0 - PAD_X)
-        safe_y0 = max(0, orig_rect.y0 - PAD_Y)
+        safe_y0 = max(0, orig_rect.y0 - PAD_Y_TOP)
         safe_x1 = min(doc[curr_p].rect.width, orig_rect.x1 + PAD_X)
-        safe_y1 = min(doc[curr_p].rect.height, orig_rect.y1 + PAD_Y)
+        safe_y1 = min(doc[curr_p].rect.height, orig_rect.y1 + PAD_Y_BOTTOM)
         
         # Check for Multipage Trailing
         is_multipage = False
@@ -349,15 +352,22 @@ def worker_process(job_id, pdf_path, job_dir):
     export_dir = os.path.join(job_dir, "master_package")
     os.makedirs(export_dir, exist_ok=True)
     
+    # We need to know total pages first
+    try:
+        temp_doc = fitz.open(pdf_path)
+        total_pages = len(temp_doc)
+        pdf_hash = get_pdf_hash(pdf_path)
+        temp_doc.close()
+    except Exception as e:
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"] = f"Failed to open PDF: {e}"
+        return
+
     try:
         log_job(job_id, "🚀 Starting Process...", "INFO")
-        doc = fitz.open(pdf_path)
-        pdf_hash = get_pdf_hash(pdf_path)
         
-        total_pages = len(doc)
         FULL_VISION_DATA = {}
         
-        # Reduced batch size slightly to improve reliability
         BATCH_SIZE = 3 
         batches = []
         for i in range(0, total_pages, BATCH_SIZE):
@@ -367,11 +377,18 @@ def worker_process(job_id, pdf_path, job_dir):
         log_job(job_id, f"⚡ Parallel Scanning {len(batches)} batches ({total_pages} pages)...", "INFO")
 
         def process_batch(indices):
-            # Add small random sleep to prevent hitting rate limit instantly
-            time.sleep(random.uniform(0.1, 1.0))
-            return indices, get_questions_ai_coordinates(job_id, doc, indices)
+            # --- THREAD SAFETY FIX ---
+            # Open a NEW handle to the PDF for this thread. 
+            # PyMuPDF Document objects are NOT thread-safe for concurrent methods.
+            thread_doc = fitz.open(pdf_path)
+            try:
+                # Add small random sleep to prevent hitting rate limit instantly
+                time.sleep(random.uniform(0.1, 0.5))
+                result = get_questions_ai_coordinates(job_id, thread_doc, indices)
+                return indices, result
+            finally:
+                thread_doc.close()
 
-        # Reduced max_workers to 4 to prevent "One Page Scan" issue due to blocking
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             future_to_batch = {executor.submit(process_batch, b): b for b in batches}
             
@@ -392,7 +409,11 @@ def worker_process(job_id, pdf_path, job_dir):
              raise Exception("Scan completed but no questions were found in any batch.")
 
         log_job(job_id, "✂️ Cropping with Padding...", "INFO")
-        final_qs = extract_and_stitch_pure_vision(job_id, doc, FULL_VISION_DATA, export_dir)
+        
+        # Open Main Doc for Cropping (Single Threaded Phase)
+        main_doc = fitz.open(pdf_path)
+        final_qs = extract_and_stitch_pure_vision(job_id, main_doc, FULL_VISION_DATA, export_dir)
+        main_doc.close()
         
         if not final_qs:
             raise Exception("No valid questions generated after cropping.")
@@ -439,7 +460,6 @@ def worker_process(job_id, pdf_path, job_dir):
         jobs[job_id]["error"] = str(e)
         log_job(job_id, f"🔥 FATAL ERROR: {str(e)}", "ERROR")
     finally:
-        if 'doc' in locals(): doc.close()
         try:
             shutil.rmtree(export_dir)
         except: pass
@@ -486,7 +506,7 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Padded Crops + Safe Batching) 🚀"
+    return "Team Stark V33 (Thread-Safe + Full Options) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
