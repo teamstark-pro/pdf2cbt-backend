@@ -124,80 +124,91 @@ def pixmap_to_base64(pix):
     except Exception as e: return ""
 
 # ==========================================
-# STRATEGY 1: REGEX (With Strict Validation)
+# STRATEGY 1: REGEX (With Smart Logic)
 # ==========================================
 
 def find_questions_via_regex(doc, pdf_type):
     questions = []
+    
+    # Expanded Patterns for different numbering styles
     patterns = [
-        r"^\s*(\d+)[\.\)\-\:]",           # 1. or 1) or 1-
-        r"^\s*Q(?:uestion)?[\.\s]*(\d+)", # Q.1 or Question 1
-        r"^\s*\((\d+)\)"                  # (1)
+        r"^\s*(\d+)[\.\)\-\:]",             # 1. 1) 1-
+        r"^\s*Q(?:uestion)?[\.\s\-]*(\d+)", # Q1, Q.1, Question 1
+        r"^\s*\[(\d+)\]",                   # [1]
+        r"^\s*Problem\s*(\d+)",             # Problem 1
+        r"^\s*Example\s*(\d+)"              # Example 1
     ]
-    bad_keywords = ["Solution", "Answer", "Exp:", "Explanation", "Page", "Fig", "Table"]
+    
+    bad_keywords = ["Solution", "Answer", "Exp:", "Explanation", "Page", "Fig", "Table", "Mark", "Time"]
     
     for p_idx in range(len(doc)):
         page = doc[p_idx]
         width = page.rect.width
+        
+        # Get blocks
         blocks = page.get_text("blocks")
         
-        # Layout Sorting
-        if pdf_type == 'double_col':
-            midpoint = width / 2
-            left_col = [b for b in blocks if b[0] < midpoint]
-            right_col = [b for b in blocks if b[0] >= midpoint]
-            left_col.sort(key=lambda b: b[1])
-            right_col.sort(key=lambda b: b[1])
-            sorted_blocks = left_col + right_col
-        else:
-            sorted_blocks = sorted(blocks, key=lambda b: b[1])
+        # Sort blocks explicitly Top-to-Bottom, Left-to-Right
+        # This prevents "Zig-Zag" sequencing errors in regex detection
+        blocks.sort(key=lambda b: (b[1], b[0])) 
 
-        for b in sorted_blocks:
+        # Filter and Match
+        for b in blocks:
             text = b[4].strip()
             if not text: continue
+            
+            # Anti-False Positive
             if any(bk in text for bk in bad_keywords): continue
+            
+            is_match = False
+            q_num = -1
             
             for pat in patterns:
                 match = re.search(pat, text, re.IGNORECASE)
                 if match:
                     try:
                         q_num = int(match.group(1))
-                        # Basic Sanity: No huge numbers (e.g. year 2024) unless it's reasonable
-                        if q_num > 500 and len(questions) < 10: continue 
+                        # Filter obvious errors (like year 2023 detected as Q2023)
+                        if q_num > 500: continue 
                         questions.append({
                             "q_num": q_num,
                             "page": p_idx,
                             "rect": fitz.Rect(b[0], b[1], b[2], b[3])
                         })
+                        is_match = True
                         break
                     except: pass
+            
+            if is_match and pdf_type == 'double_col':
+                # If double column, we might need stricter x-coord sorting later
+                pass
 
-    # --- VALIDATION LAYER ---
-    if not questions: return []
+    # --- STRICT VALIDATION (FAIL-SAFE) ---
+    if not questions: return None
     
+    # Sort by Question Number found
     questions.sort(key=lambda x: x["q_num"])
     
-    # Check Sequence Quality
-    # If we have [1, 2, 50, 100, 3] -> That's bad.
-    # We want roughly [1, 2, 3, 4, 5...]
-    
+    # Check Sequence Continuity
+    # If we have 1, 2, 5, 80 -> The regex is picking up garbage. Fail it.
     valid_qs = []
     last_q = 0
     strikes = 0
     
     for q in questions:
-        # Allow gaps (e.g. 1 -> 2 -> 4 is okay, maybe 3 was missed)
-        # But 1 -> 50 is suspicious
-        if q["q_num"] <= last_q: continue # Duplicate or out of order
-        if q["q_num"] > last_q + 10: 
+        if q["q_num"] <= last_q: continue # Duplicate/Overlap
+        
+        # If gap is huge (e.g. Q2 to Q50), count a strike
+        if q["q_num"] > last_q + 5: 
             strikes += 1
         
         valid_qs.append(q)
         last_q = q["q_num"]
         
-    # If too many large gaps, the text layer is likely broken/garbage
-    if strikes > 3:
-        return None # Signal to switch to AI
+    # Threshold: If regex sequence is too broken, assume text layer is bad
+    # and force switch to Vision AI.
+    if strikes > 2 or len(valid_qs) < 3: 
+        return None 
         
     return valid_qs
 
@@ -304,11 +315,6 @@ def get_prompt_for_type(pdf_type):
         Do NOT confuse questions across the line.
         {base_rules}
         """
-    elif pdf_type == 'raw_text':
-        return f"""
-        Analyze this **SIMPLE LIST**. Identify bounding box for numbered items.
-        {base_rules}
-        """
     else:
         return f"""
         Analyze this **SINGLE COLUMN** exam page.
@@ -370,6 +376,7 @@ def extract_and_stitch_vision(job_id, doc, vision_map, export_dir, pdf_type):
         w = page.rect.width
         h = page.rect.height
         for item in items:
+            # Snap Logic
             if pdf_type == 'single_col':
                 if item['x0'] < 100: item['x0'] = 0
                 if item['x1'] > 900: item['x1'] = 1000
@@ -479,21 +486,22 @@ def worker_process(job_id, pdf_path, job_dir, pdf_type):
             log_job(job_id, "🔍 Strategy 1: Text Layer Scan...", "INFO")
             questions = find_questions_via_regex(doc, pdf_type)
             
-            # Smart Validation: If Regex returns junk or nothing, fallback.
-            if questions and len(questions) > 0:
+            # Smart Validation
+            if questions:
                 log_job(job_id, f"✅ Regex valid. Found {len(questions)} items.", "SUCCESS")
                 final_qs = crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type)
+            else:
+                log_job(job_id, "⚠️ Regex weak/empty. Fallback to Vision AI...", "WARN")
             
             # --- ATTEMPT 2: VISION AI (Fallback) ---
             if not final_qs:
-                log_job(job_id, "⚠️ Regex failed (Bad Text Layer). Switching to Vision AI...", "WARN")
                 FULL_VISION_DATA = {}
                 BATCH_SIZE = 2
                 batches = [list(range(i, min(i + BATCH_SIZE, len(doc)))) for i in range(0, len(doc), BATCH_SIZE)]
                 
                 for indices in batches:
                     log_job(job_id, f"   -> AI Scanning Pages {[p+1 for p in indices]}...", "INFO")
-                    batch_doc = fitz.open(pdf_path) # Fresh handle
+                    batch_doc = fitz.open(pdf_path) 
                     try:
                         result = get_questions_ai_coordinates(job_id, batch_doc, indices, pdf_type)
                         if result:
