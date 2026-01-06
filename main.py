@@ -128,9 +128,6 @@ def pixmap_to_base64(pix):
 # --- CORE LOGIC ---
 
 def get_questions_ai_coordinates(job_id, doc, page_indices):
-    """
-    UNIVERSAL COORDINATE DETECTION (SEQUENTIAL MODE)
-    """
     payload_content = [
         {
             "type": "text",
@@ -201,7 +198,6 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                             x1 = int(str(item.get("x_end", "1000")).strip())
                             y1 = int(str(item.get("y_end", "1000")).strip())
                             
-                            # Safety Fixes for coordinate inversion
                             if x1 <= x0: x1 = 1000
                             if y1 <= y0: y1 = y0 + 100
                             
@@ -212,7 +208,6 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                             })
                         except: pass
                 
-                # Sort by Y position mainly, then X
                 cleaned_items.sort(key=lambda x: (x["y0"], x["x0"]))
                 result_map[real_page_idx] = cleaned_items
                 
@@ -227,19 +222,11 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         h = page.rect.height
         
         for item in items:
-            # RELAXED SNAP LOGIC
-            # Only snap if VERY close to edge (< 2% margin)
-            # This allows columns to exist without being forced to full width
-            
             # Snap X-Start
-            if item['x0'] < 20: 
-                item['x0'] = 0
-            
+            if item['x0'] < 20: item['x0'] = 0
             # Snap X-End
-            if item['x1'] > 980: 
-                item['x1'] = 1000
+            if item['x1'] > 980: item['x1'] = 1000
             
-            # Convert 0-1000 scale to actual PDF points
             x0 = (item['x0'] / 1000.0) * w
             y0 = (item['y0'] / 1000.0) * h
             x1 = (item['x1'] / 1000.0) * w
@@ -253,11 +240,7 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
                 "raw_y1_score": item['y1']
             })
 
-    # --- CRITICAL SEQUENCING FIX ---
-    # Sort primarily by Question Number.
-    # This solves the "Zig Zag" reading issue in multi-column PDFs.
-    # If Q1 is top-left and Q2 is top-right, sorting by Y might mix them.
-    # Sorting by Q-Num ensures correct order.
+    # Sort primarily by Question Number to fix sequencing
     all_qs_coords.sort(key=lambda x: x["q_num_int"])
     
     log_job(job_id, f"✅ AI identified {len(all_qs_coords)} bounding boxes.", "INFO")
@@ -266,7 +249,6 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
 
     final_output = []
     
-    # GENERALLY INCREASED PADDING TO BE SAFE
     PAD_Y_TOP = 40  
     PAD_Y_BOTTOM = 50 
     PAD_X = 30  
@@ -285,43 +267,34 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         if q["raw_y1_score"] >= 980:
              is_multipage = True
              safe_y1 = doc[curr_p].rect.height - 40
-        # Check sequencing on same page overlap
         elif i + 1 < len(all_qs_coords):
              next_q = all_qs_coords[i+1]
-             # If next Q is on SAME page AND generally below current Q
-             # We can use it as a bottom bound, BUT ONLY if in same column zone
-             # Simple logic: If current Q ends way past next Q start, trim it.
-             if next_q["page"] == curr_p and next_q["rect"].y0 > orig_rect.y0:
-                 if safe_y1 > next_q["rect"].y0:
-                      safe_y1 = max(safe_y1, next_q["rect"].y0 - 15)
+             if next_q["page"] > curr_p and q["raw_y1_score"] > 900:
+                 is_multipage = True
+                 safe_y1 = doc[curr_p].rect.height - 40
 
         segments = []
-        
-        # Segment 1
         segments.append({
             "page": curr_p,
             "rect": fitz.Rect(safe_x0, safe_y0, safe_x1, safe_y1)
         })
         
-        # Segment 2+ (Stitching)
         if is_multipage and i + 1 < len(all_qs_coords):
             next_q = all_qs_coords[i+1]
             next_q_page = next_q["page"]
             
-            # Only stitch if next question is actually on a later page
-            if next_q_page > curr_p:
-                for gap_p in range(curr_p + 1, next_q_page):
-                    segments.append({
-                        "page": gap_p,
-                        "rect": fitz.Rect(safe_x0, 40, safe_x1, doc[gap_p].rect.height - 40)
-                    })
-                
-                next_q_y = next_q["rect"].y0 - 20
-                next_q_y = max(50, next_q_y)
+            for gap_p in range(curr_p + 1, next_q_page):
                 segments.append({
-                    "page": next_q_page,
-                    "rect": fitz.Rect(safe_x0, 40, safe_x1, next_q_y)
+                    "page": gap_p,
+                    "rect": fitz.Rect(safe_x0, 40, safe_x1, doc[gap_p].rect.height - 40)
                 })
+            
+            next_q_y = next_q["rect"].y0 - 20
+            next_q_y = max(50, next_q_y)
+            segments.append({
+                "page": next_q_page,
+                "rect": fitz.Rect(safe_x0, 40, safe_x1, next_q_y)
+            })
 
         images = []
         total_h = 0
@@ -329,11 +302,23 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         
         for seg in segments:
             page = doc[seg['page']]
-            pix = page.get_pixmap(dpi=200, clip=seg['rect'])
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            images.append(img)
-            total_h += img.height
-            max_w = max(max_w, img.width)
+            
+            # --- CRITICAL FIX: Safe Intersection ---
+            # Intersect with page bounds to prevent "tile cannot extend outside image" crash
+            clip_rect = seg['rect'] & page.rect
+            
+            if clip_rect.is_empty or clip_rect.width <= 0 or clip_rect.height <= 0:
+                continue
+
+            try:
+                pix = page.get_pixmap(dpi=200, clip=clip_rect)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                images.append(img)
+                total_h += img.height
+                max_w = max(max_w, img.width)
+            except Exception as e:
+                print(f"Render Error Q{q['label']}: {e}")
+                continue
         
         if not images: continue
         
@@ -356,7 +341,6 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
     return final_output
 
 def worker_process(job_id, pdf_path, job_dir):
-    # CRITICAL: Acquire Semaphore (Wait in Queue if busy)
     with job_semaphore:
         export_dir = os.path.join(job_dir, "master_package")
         os.makedirs(export_dir, exist_ok=True)
@@ -377,7 +361,8 @@ def worker_process(job_id, pdf_path, job_dir):
             log_job(job_id, f"🚀 STARTING JOB (Sequential). Pages: {total_pages}", "INFO")
             
             FULL_VISION_DATA = {}
-            BATCH_SIZE = 4 
+            # Reduced Batch Size to 2 to improve reliability/completion rate
+            BATCH_SIZE = 2 
             batches = []
             for i in range(0, total_pages, BATCH_SIZE):
                 indices = list(range(i, min(i + BATCH_SIZE, total_pages)))
@@ -385,13 +370,8 @@ def worker_process(job_id, pdf_path, job_dir):
                 
             log_job(job_id, f"⚡ Processing {len(batches)} batches sequentially...", "INFO")
 
-            # --- SEQUENTIAL PROCESSING (NO THREADING) ---
-            # This is simpler and less prone to "race conditions" or "silent failures"
-            
             for indices in batches:
                 log_job(job_id, f"   -> Scanning Pages {[p+1 for p in indices]}...", "INFO")
-                
-                # Open a FRESH doc handle for every batch to be perfectly safe
                 batch_doc = fitz.open(pdf_path)
                 try:
                     result = get_questions_ai_coordinates(job_id, batch_doc, indices)
@@ -402,17 +382,14 @@ def worker_process(job_id, pdf_path, job_dir):
                             log_job(job_id, f"      Found Qs: {q_nums}", "INFO")
                     else:
                         log_job(job_id, "      No questions found in this batch.", "WARN")
-                    
-                    # Polite sleep to respect Groq
                     time.sleep(1) 
-                    
                 except Exception as e:
                     log_job(job_id, f"      Batch Error: {str(e)}", "ERROR")
                 finally:
                     batch_doc.close()
 
             if not FULL_VISION_DATA:
-                 raise Exception("Scan completed but no questions were found in any batch.")
+                 raise Exception("Scan completed but no questions were found.")
 
             log_job(job_id, "✂️ Universal Cropping (Snap-to-Edge)...", "INFO")
             
@@ -421,7 +398,7 @@ def worker_process(job_id, pdf_path, job_dir):
             main_doc.close()
             
             if not final_qs:
-                raise Exception("No valid questions generated after cropping.")
+                raise Exception("No valid questions generated.")
                 
             log_job(job_id, "📦 Generating Data Package...", "INFO")
             
@@ -488,7 +465,6 @@ def start_job():
     
     jobs[job_id] = {"status": "queued", "logs": [], "file_path": None, "error": None}
     
-    # Spawn thread (It will wait at the Semaphore if busy)
     thread = threading.Thread(target=worker_process, args=(job_id, save_path, job_dir))
     thread.daemon = True
     thread.start()
@@ -512,7 +488,7 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Sequential + Snap-to-Edge Universal) 🚀"
+    return "Team Stark V33 (Sequential + Safe Crops) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
