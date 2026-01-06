@@ -16,6 +16,7 @@ from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 import fitz  # PyMuPDF
 from PIL import Image
+from groq import Groq, RateLimitError, BadRequestError
 
 # --- CONFIGURATION ---
 app = Flask(__name__)
@@ -47,6 +48,62 @@ def log_job(job_id, msg, level="INFO"):
 jobs = {}
 STARK_SECRET = os.environ.get("STARK_SECRET_KEY", "open_access_mode")
 
+# --- MODEL CONFIGURATION ---
+CURRENT_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+# --- SMARTER GROQ MANAGER ---
+class SmartGroqManager:
+    def __init__(self):
+        raw_keys = os.environ.get("GROQ_API_KEYS", "")
+        self.all_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        self.key_cooldowns = {k: 0 for k in self.all_keys}
+        if not self.all_keys:
+            log_job("SYSTEM", "⚠️ No GROQ_API_KEYS found!", "WARN")
+
+    def get_client(self):
+        if not self.all_keys: return None, None
+        now = time.time()
+        available_keys = [k for k in self.all_keys if now >= self.key_cooldowns[k]]
+        
+        if not available_keys:
+            selected_key = random.choice(self.all_keys)
+        else:
+            selected_key = random.choice(available_keys)
+            
+        return Groq(api_key=selected_key), selected_key
+
+    def mark_rate_limited(self, key):
+        self.key_cooldowns[key] = time.time() + 5
+        print(f"[SYSTEM] ⚠️ Rate limit on key ...{key[-4:]}. Pausing it for 5s.", flush=True)
+
+    def call_vision_batch(self, message_payload, retries=5):
+        for attempt in range(retries):
+            client, key_used = self.get_client()
+            if not client: return None
+            try:
+                completion = client.chat.completions.create(
+                    model=CURRENT_VISION_MODEL,
+                    messages=[{"role": "user", "content": message_payload}],
+                    temperature=0.1, max_tokens=4096, top_p=1, stream=False,
+                    response_format={"type": "json_object"}
+                )
+                return json.loads(completion.choices[0].message.content)
+            except RateLimitError:
+                self.mark_rate_limited(key_used)
+                time.sleep(1) 
+            except BadRequestError as e:
+                if "decommissioned" in str(e).lower():
+                     log_job("SYSTEM", f"🔥 FATAL: Model {CURRENT_VISION_MODEL} decommissioned.", "ERROR")
+                     break 
+                log_job("SYSTEM", f"❌ Bad Request: {str(e)}", "ERROR")
+                break
+            except Exception as e:
+                log_job("SYSTEM", f"❌ Groq Error: {str(e)}", "ERROR")
+                time.sleep(1)
+        return None
+
+groq_manager = SmartGroqManager()
+
 # --- UTILS ---
 def is_authorized(req):
     if STARK_SECRET == "open_access_mode": return True
@@ -59,7 +116,16 @@ def get_pdf_hash(path):
             sha.update(chunk)
     return sha.hexdigest()
 
-# --- REGEX ENGINE LOGIC ---
+def pixmap_to_base64(pix):
+    try:
+        if pix.alpha: pix = fitz.Pixmap(fitz.csRGB, pix)
+        img_data = pix.tobytes("jpeg", jpg_quality=85)
+        return base64.b64encode(img_data).decode('utf-8')
+    except Exception as e: return ""
+
+# ==========================================
+# STRATEGY 1: REGEX (Text Layer Analysis)
+# ==========================================
 
 def find_questions_via_regex(doc, pdf_type):
     """
@@ -68,50 +134,36 @@ def find_questions_via_regex(doc, pdf_type):
     """
     questions = []
     
-    # Comprehensive Regex Patterns for Question Numbers
-    # 1. "1.", "1)", "Q1", "Q.1", "Question 1"
+    # Regex Patterns
     patterns = [
         r"^\s*(\d+)[\.\)\-\:]",           # 1. or 1) or 1-
         r"^\s*Q(?:uestion)?[\.\s]*(\d+)", # Q.1 or Question 1
         r"^\s*\((\d+)\)"                  # (1)
     ]
     
-    # Keywords to avoid (False Positives)
     bad_keywords = ["Solution", "Answer", "Exp:", "Explanation", "Page", "Fig", "Table"]
-
     total_pages = len(doc)
     
     for p_idx in range(total_pages):
         page = doc[p_idx]
         width = page.rect.width
-        height = page.rect.height
         
-        # Get all text blocks: (x0, y0, x1, y1, text, block_no, block_type)
         blocks = page.get_text("blocks")
         
-        # --- LAYOUT SORTING STRATEGY ---
+        # Layout Sorting
         if pdf_type == 'double_col':
-            # Split into Left and Right Columns based on midline
             midpoint = width / 2
             left_col = [b for b in blocks if b[0] < midpoint]
             right_col = [b for b in blocks if b[0] >= midpoint]
-            
-            # Sort each column Top-to-Bottom
             left_col.sort(key=lambda b: b[1])
             right_col.sort(key=lambda b: b[1])
-            
-            # Merge: Process Left column then Right column
             sorted_blocks = left_col + right_col
         else:
-            # Single Column: Just sort Top-to-Bottom
             sorted_blocks = sorted(blocks, key=lambda b: b[1])
 
-        # Scan blocks for Question Starters
         for b in sorted_blocks:
             text = b[4].strip()
             if not text: continue
-            
-            # Filter bad keywords
             if any(bk in text for bk in bad_keywords): continue
             
             is_match = False
@@ -122,7 +174,6 @@ def find_questions_via_regex(doc, pdf_type):
                 if match:
                     try:
                         q_num = int(match.group(1))
-                        # Basic sanity check: Question number shouldn't be crazy huge relative to count
                         if q_num > 1000: continue 
                         is_match = True
                         break
@@ -132,99 +183,63 @@ def find_questions_via_regex(doc, pdf_type):
                 questions.append({
                     "q_num": q_num,
                     "page": p_idx,
-                    "rect": fitz.Rect(b[0], b[1], b[2], b[3]), # The text block rect
+                    "rect": fitz.Rect(b[0], b[1], b[2], b[3]),
                     "raw_text": text[:20] + "..."
                 })
 
-    # Sort final list by Question Number to ensure 1, 2, 3 sequence
-    # This fixes cases where a header/footer might have been picked up erroneously
-    # Or if layout sorting wasn't perfect
     questions.sort(key=lambda x: x["q_num"])
-    
     return questions
 
-def crop_and_stitch(job_id, doc, questions, export_dir, pdf_type):
+def crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type):
     """
-    Uses the precise Text Block coordinates to define Crop Areas.
-    Stitches accurately from Q(n).top to Q(n+1).top
+    Precision cropping based on Text Layer Coordinates.
     """
     final_output = []
-    
-    # Universal Padding
     PAD_TOP = 15
     PAD_BOTTOM = 10
     
     for i, q in enumerate(questions):
         curr_p = q["page"]
-        
-        # Start: Top of current question block (minus padding)
         y_start = max(0, q["rect"].y0 - PAD_TOP)
-        
-        # Calculate End Point
         y_end = -1
         is_multipage = False
         
-        # Look at next question to determine cut point
         if i + 1 < len(questions):
             next_q = questions[i+1]
-            
             if next_q["page"] == curr_p:
-                # Same Page: Cut slightly before next question starts
-                # Logic check: Next Q should be below Current Q
-                # For Double Col: Check if Next Q is in same column
-                
+                # Same Page Logic
                 if pdf_type == 'double_col':
-                    # Determine columns
                     curr_is_left = q["rect"].x0 < (doc[curr_p].rect.width / 2)
                     next_is_left = next_q["rect"].x0 < (doc[curr_p].rect.width / 2)
-                    
                     if curr_is_left == next_is_left:
-                        # Same column, standard cut
                         y_end = max(y_start + 50, next_q["rect"].y0 - PAD_BOTTOM)
                     else:
-                        # Different column, Current Q goes to bottom of its column
                         y_end = doc[curr_p].rect.height - 40
                 else:
-                    # Single Col: Simple cut
                     y_end = max(y_start + 50, next_q["rect"].y0 - PAD_BOTTOM)
             else:
-                # Next Q is on later page
                 is_multipage = True
-                y_end = doc[curr_p].rect.height - 40 # Margin
+                y_end = doc[curr_p].rect.height - 40
         else:
-            # Last question
             y_end = doc[curr_p].rect.height - 40
 
         # Define Crop Width
         page_width = doc[curr_p].rect.width
         if pdf_type == 'double_col':
-            # Check which side this question is on
             if q["rect"].x0 < (page_width / 2):
                 x_start, x_end = 0, (page_width / 2)
             else:
                 x_start, x_end = (page_width / 2), page_width
         else:
-            # Single Col: Full Width
             x_start, x_end = 0, page_width
 
         segments = []
+        segments.append({"page": curr_p, "rect": fitz.Rect(x_start, y_start, x_end, y_end)})
         
-        # 1. Main Segment
-        segments.append({
-            "page": curr_p,
-            "rect": fitz.Rect(x_start, y_start, x_end, y_end)
-        })
-        
-        # 2. Stitching (Multi-page)
         if is_multipage and i + 1 < len(questions):
             next_q = questions[i+1]
             next_p = next_q["page"]
             
-            # Simple stitching: Grab intermediate pages fully? 
-            # Or assume same column logic? 
-            # Safe bet: Grab Top of next page until Next Q starts.
-            
-            # Determine column of Next Q to know width
             if pdf_type == 'double_col':
                  if next_q["rect"].x0 < (doc[next_p].rect.width / 2):
                      nx_start, nx_end = 0, (doc[next_p].rect.width / 2)
@@ -234,24 +249,16 @@ def crop_and_stitch(job_id, doc, questions, export_dir, pdf_type):
                 nx_start, nx_end = 0, doc[next_p].rect.width
             
             next_q_y = max(50, next_q["rect"].y0 - PAD_BOTTOM)
-            
-            # Add segment from next page
-            segments.append({
-                "page": next_p,
-                "rect": fitz.Rect(nx_start, 40, nx_end, next_q_y) # Start at 40 to skip header
-            })
+            segments.append({"page": next_p, "rect": fitz.Rect(nx_start, 40, nx_end, next_q_y)})
 
-        # Render & Stitch
         images = []
         total_h = 0
         max_w = 0
         
         for seg in segments:
             page = doc[seg['page']]
-            clip_rect = seg['rect'] & page.rect # Safe intersection
-            
+            clip_rect = seg['rect'] & page.rect
             if clip_rect.is_empty: continue
-            
             try:
                 pix = page.get_pixmap(dpi=200, clip=clip_rect)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -262,14 +269,12 @@ def crop_and_stitch(job_id, doc, questions, export_dir, pdf_type):
             
         if not images: continue
         
-        # Final Image
         final_img = Image.new('RGB', (max_w, total_h), (255, 255, 255))
         cy = 0
         for img in images:
             final_img.paste(img, (0, cy))
             cy += img.height
             
-        # Naming
         fname = f"Stark__--__{q['q_num']}__--__1.png"
         fpath = os.path.join(export_dir, fname)
         if os.path.exists(fpath):
@@ -281,6 +286,183 @@ def crop_and_stitch(job_id, doc, questions, export_dir, pdf_type):
         
     return final_output
 
+# ==========================================
+# STRATEGY 2: VISION AI (Fallback)
+# ==========================================
+
+def get_prompt_for_type(pdf_type):
+    base_rules = """
+    OUTPUT RULES:
+    Return JSON. Key: "img_0", Value: LIST of objects:
+    { "q_num": Integer, "x_start": Integer (0-1000), "y_start": Integer (0-1000), "x_end": Integer (0-1000), "y_end": Integer (0-1000) }
+    """
+    if pdf_type == 'double_col':
+        return f"""
+        Analyze this **DOUBLE COLUMN** exam page.
+        Split vertical at x=500. Left Col first, then Right Col.
+        Do NOT confuse questions across the line.
+        {base_rules}
+        """
+    elif pdf_type == 'raw_text':
+        return f"""
+        Analyze this **SIMPLE LIST**. Identify bounding box for numbered items.
+        {base_rules}
+        """
+    else:
+        return f"""
+        Analyze this **SINGLE COLUMN** exam page.
+        Questions flow Top to Bottom. x_start near 0, x_end near 1000.
+        {base_rules}
+        """
+
+def get_questions_ai_coordinates(job_id, doc, page_indices, pdf_type):
+    prompt_text = get_prompt_for_type(pdf_type)
+    payload_content = [{"type": "text", "text": prompt_text}]
+    valid_map = {}
+    
+    for i, p_idx in enumerate(page_indices):
+        try:
+            page = doc[p_idx]
+            pix = page.get_pixmap(dpi=100)
+            b64 = pixmap_to_base64(pix)
+            if not b64: continue
+            key = f"img_{i}"
+            valid_map[key] = p_idx
+            payload_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        except: pass
+
+    if not valid_map: return None
+    response = groq_manager.call_vision_batch(payload_content)
+    result_map = {}
+    
+    if response:
+        for img_key, item_list in response.items():
+            if img_key in valid_map:
+                real_page_idx = valid_map[img_key]
+                cleaned_items = []
+                if isinstance(item_list, list):
+                    for item in item_list:
+                        try:
+                            q_num = int(str(item.get("q_num", "")).strip())
+                            x0 = int(str(item.get("x_start", "0")).strip())
+                            y0 = int(str(item.get("y_start", "0")).strip())
+                            x1 = int(str(item.get("x_end", "1000")).strip())
+                            y1 = int(str(item.get("y_end", "1000")).strip())
+                            
+                            if x1 <= x0: x1 = 1000
+                            if y1 <= y0: y1 = y0 + 100
+                            
+                            cleaned_items.append({"q": q_num, "x0": x0, "y0": y0, "x1": x1, "y1": y1})
+                        except: pass
+                
+                if pdf_type == 'double_col':
+                    cleaned_items.sort(key=lambda x: (0 if x["x0"] < 500 else 1, x["y0"]))
+                else:
+                    cleaned_items.sort(key=lambda x: x["y0"])
+                result_map[real_page_idx] = cleaned_items
+    return result_map
+
+def extract_and_stitch_vision(job_id, doc, vision_map, export_dir, pdf_type):
+    all_qs_coords = []
+    for p_idx, items in vision_map.items():
+        page = doc[p_idx]
+        w = page.rect.width
+        h = page.rect.height
+        for item in items:
+            if pdf_type == 'single_col':
+                if item['x0'] < 100: item['x0'] = 0
+                if item['x1'] > 900: item['x1'] = 1000
+            elif pdf_type == 'double_col':
+                if item['x0'] < 20: item['x0'] = 0
+                if item['x1'] > 980: item['x1'] = 1000
+            
+            x0 = (item['x0'] / 1000.0) * w
+            y0 = (item['y0'] / 1000.0) * h
+            x1 = (item['x1'] / 1000.0) * w
+            y1 = (item['y1'] / 1000.0) * h
+            
+            all_qs_coords.append({
+                "label": str(item['q']),
+                "q_num_int": item['q'],
+                "page": p_idx,
+                "rect": fitz.Rect(x0, y0, x1, y1),
+                "raw_y1_score": item['y1']
+            })
+
+    all_qs_coords.sort(key=lambda x: x["q_num_int"])
+    if not all_qs_coords: return []
+
+    final_output = []
+    PAD_Y_TOP = 40
+    PAD_Y_BOTTOM = 50 
+    PAD_X = 30  
+    
+    for i, q in enumerate(all_qs_coords):
+        curr_p = q["page"]
+        orig_rect = q["rect"]
+        safe_x0 = max(0, orig_rect.x0 - PAD_X)
+        safe_y0 = max(0, orig_rect.y0 - PAD_Y_TOP)
+        safe_x1 = min(doc[curr_p].rect.width, orig_rect.x1 + PAD_X)
+        safe_y1 = min(doc[curr_p].rect.height, orig_rect.y1 + PAD_Y_BOTTOM)
+        
+        is_multipage = False
+        if q["raw_y1_score"] >= 980:
+             is_multipage = True
+             safe_y1 = doc[curr_p].rect.height - 40
+        elif i + 1 < len(all_qs_coords):
+             next_q = all_qs_coords[i+1]
+             if next_q["page"] > curr_p:
+                 is_multipage = True
+                 safe_y1 = doc[curr_p].rect.height - 40
+
+        segments = []
+        segments.append({"page": curr_p, "rect": fitz.Rect(safe_x0, safe_y0, safe_x1, safe_y1)})
+        
+        if is_multipage and i + 1 < len(all_qs_coords):
+            next_q = all_qs_coords[i+1]
+            next_q_page = next_q["page"]
+            for gap_p in range(curr_p + 1, next_q_page):
+                segments.append({"page": gap_p, "rect": fitz.Rect(safe_x0, 40, safe_x1, doc[gap_p].rect.height - 40)})
+            
+            next_q_y = next_q["rect"].y0 - 20
+            segments.append({"page": next_q_page, "rect": fitz.Rect(safe_x0, 40, safe_x1, max(50, next_q_y))})
+
+        images = []
+        total_h = 0
+        max_w = 0
+        for seg in segments:
+            page = doc[seg['page']]
+            clip_rect = seg['rect'] & page.rect
+            if clip_rect.is_empty: continue
+            try:
+                pix = page.get_pixmap(dpi=200, clip=clip_rect)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                images.append(img)
+                total_h += img.height
+                max_w = max(max_w, img.width)
+            except: pass
+        
+        if not images: continue
+        final_img = Image.new('RGB', (max_w, total_h), (255, 255, 255))
+        cy = 0
+        for img in images:
+            final_img.paste(img, (0, cy))
+            cy += img.height
+            
+        fname = f"Stark__--__{q['label']}__--__1.png"
+        fpath = os.path.join(export_dir, fname)
+        if os.path.exists(fpath):
+            fname = f"Stark__--__{q['label']}_{uuid.uuid4().hex[:4]}__--__1.png"
+            fpath = os.path.join(export_dir, fname)
+        final_img.save(fpath)
+        final_output.append({"label": q['label'], "filename": fname})
+        
+    return final_output
+
+# ==========================================
+# WORKER PROCESS (HYBRID)
+# ==========================================
+
 def worker_process(job_id, pdf_path, job_dir, pdf_type):
     with job_semaphore:
         export_dir = os.path.join(job_dir, "master_package")
@@ -289,30 +471,57 @@ def worker_process(job_id, pdf_path, job_dir, pdf_type):
         try:
             doc = fitz.open(pdf_path)
             pdf_hash = get_pdf_hash(pdf_path)
+            log_job(job_id, f"🚀 JOB STARTED ({pdf_type}). Pages: {len(doc)}", "INFO")
             
-            log_job(job_id, f"🚀 STARTING REGEX JOB ({pdf_type.upper()}). Pages: {len(doc)}", "INFO")
+            final_qs = []
             
-            # 1. Find Coordinates via Regex
+            # --- ATTEMPT 1: REGEX ---
+            log_job(job_id, "🔍 Strategy 1: Text Layer Scan...", "INFO")
             questions = find_questions_via_regex(doc, pdf_type)
             
-            if not questions:
-                log_job(job_id, "❌ No questions found via Text Layer. PDF might be scanned images only.", "ERROR")
-                raise Exception("No text layer found. Please OCR your PDF first.")
+            if questions:
+                log_job(job_id, f"✅ Text Layer found {len(questions)} items. Processing...", "SUCCESS")
+                final_qs = crop_and_stitch_regex(job_id, doc, questions, export_dir, pdf_type)
+            
+            # --- ATTEMPT 2: VISION AI (Fallback) ---
+            else:
+                log_job(job_id, "⚠️ No Text Layer found. Switching to Vision AI...", "WARN")
+                FULL_VISION_DATA = {}
+                BATCH_SIZE = 2
+                batches = [list(range(i, min(i + BATCH_SIZE, len(doc)))) for i in range(0, len(doc), BATCH_SIZE)]
                 
-            qs_found = [q['q_num'] for q in questions]
-            log_job(job_id, f"✅ Regex found {len(questions)} questions: {qs_found[:10]}...", "SUCCESS")
+                for indices in batches:
+                    log_job(job_id, f"   -> AI Scanning Pages {[p+1 for p in indices]}...", "INFO")
+                    batch_doc = fitz.open(pdf_path) # Fresh handle for memory safety
+                    try:
+                        result = get_questions_ai_coordinates(job_id, batch_doc, indices, pdf_type)
+                        if result:
+                            for k, v in result.items():
+                                FULL_VISION_DATA[k] = v
+                                log_job(job_id, f"      Found: {[x['q'] for x in v]}", "INFO")
+                        time.sleep(1)
+                    except Exception as e:
+                        log_job(job_id, f"      AI Error: {str(e)}", "ERROR")
+                    finally:
+                        batch_doc.close()
+                
+                if FULL_VISION_DATA:
+                    log_job(job_id, "✂️ Vision Cropping...", "INFO")
+                    # Re-open doc for final cropping phase
+                    main_doc = fitz.open(pdf_path)
+                    final_qs = extract_and_stitch_vision(job_id, main_doc, FULL_VISION_DATA, export_dir, pdf_type)
+                    main_doc.close()
             
-            # 2. Crop
-            log_job(job_id, "✂️ Precision Cropping...", "INFO")
-            final_qs = crop_and_stitch(job_id, doc, questions, export_dir, pdf_type)
-            
-            # 3. Pack
+            if not final_qs:
+                raise Exception("Failed to extract any questions via Regex or AI.")
+                
             log_job(job_id, "📦 Generating Data Package...", "INFO")
+            
             data_json = {
                 "testConfig": {"pdfFileHash": pdf_hash},
                 "pdfCropperData": {"Stark": {"Stark": {}}},
                 "appVersion": "1.30.0",
-                "generatedBy": "Team_Stark_Regex_V1"
+                "generatedBy": "Team_Stark_Hybrid_V33"
             }
             
             for q in final_qs:
@@ -322,11 +531,8 @@ def worker_process(job_id, pdf_path, job_dir, pdf_type):
                      except: pass
 
                 data_json["pdfCropperData"]["Stark"]["Stark"][key] = {
-                    "que": key,
-                    "type": "mcq",
-                    "marks": {"cm": 4, "im": -1},
-                    "answerOptions": "4",
-                    "pdfData": [{"x1": 5, "x2": 995, "y1": 100, "y2": 500, "page": 1}]
+                    "que": key, "type": "mcq", "marks": {"cm": 4, "im": -1},
+                    "answerOptions": "4", "pdfData": [{"x1": 5, "x2": 995, "y1": 100, "y2": 500, "page": 1}]
                 }
             
             with open(os.path.join(export_dir, "data.json"), "w") as f:
@@ -340,7 +546,7 @@ def worker_process(job_id, pdf_path, job_dir, pdf_type):
             
             jobs[job_id]["status"] = "completed"
             jobs[job_id]["file_path"] = zip_path
-            log_job(job_id, "✅ DONE.", "SUCCESS")
+            log_job(job_id, "✅ JOB COMPLETE.", "SUCCESS")
             
         except Exception as e:
             jobs[job_id]["status"] = "failed"
@@ -394,8 +600,9 @@ def download_result(job_id):
 
 @app.route('/')
 def home():
-    return "Team Stark V33 (Regex Engine) 🚀"
+    return "Team Stark V33 (Hybrid Regex+Vision) 🚀"
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, threaded=True)
+     
