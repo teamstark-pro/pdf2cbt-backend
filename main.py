@@ -212,6 +212,7 @@ def get_questions_ai_coordinates(job_id, doc, page_indices):
                             })
                         except: pass
                 
+                # Sort by Y position mainly, then X
                 cleaned_items.sort(key=lambda x: (x["y0"], x["x0"]))
                 result_map[real_page_idx] = cleaned_items
                 
@@ -226,16 +227,16 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         h = page.rect.height
         
         for item in items:
-            # UNIVERSAL SNAP-TO-EDGE LOGIC
-            # If AI says we are close to the edge, Snap to the edge.
-            # This fixes "Single Column" cutoffs perfectly.
+            # RELAXED SNAP LOGIC
+            # Only snap if VERY close to edge (< 2% margin)
+            # This allows columns to exist without being forced to full width
             
             # Snap X-Start
-            if item['x0'] < 100: 
+            if item['x0'] < 20: 
                 item['x0'] = 0
             
             # Snap X-End
-            if item['x1'] > 900: 
+            if item['x1'] > 980: 
                 item['x1'] = 1000
             
             # Convert 0-1000 scale to actual PDF points
@@ -246,12 +247,19 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
             
             all_qs_coords.append({
                 "label": str(item['q']),
+                "q_num_int": item['q'],
                 "page": p_idx,
                 "rect": fitz.Rect(x0, y0, x1, y1),
                 "raw_y1_score": item['y1']
             })
 
-    all_qs_coords.sort(key=lambda x: (x["page"], x["rect"].y0))
+    # --- CRITICAL SEQUENCING FIX ---
+    # Sort primarily by Question Number.
+    # This solves the "Zig Zag" reading issue in multi-column PDFs.
+    # If Q1 is top-left and Q2 is top-right, sorting by Y might mix them.
+    # Sorting by Q-Num ensures correct order.
+    all_qs_coords.sort(key=lambda x: x["q_num_int"])
+    
     log_job(job_id, f"✅ AI identified {len(all_qs_coords)} bounding boxes.", "INFO")
     
     if not all_qs_coords: return []
@@ -277,11 +285,15 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
         if q["raw_y1_score"] >= 980:
              is_multipage = True
              safe_y1 = doc[curr_p].rect.height - 40
+        # Check sequencing on same page overlap
         elif i + 1 < len(all_qs_coords):
              next_q = all_qs_coords[i+1]
-             if next_q["page"] > curr_p and q["raw_y1_score"] > 900:
-                 is_multipage = True
-                 safe_y1 = doc[curr_p].rect.height - 40
+             # If next Q is on SAME page AND generally below current Q
+             # We can use it as a bottom bound, BUT ONLY if in same column zone
+             # Simple logic: If current Q ends way past next Q start, trim it.
+             if next_q["page"] == curr_p and next_q["rect"].y0 > orig_rect.y0:
+                 if safe_y1 > next_q["rect"].y0:
+                      safe_y1 = max(safe_y1, next_q["rect"].y0 - 15)
 
         segments = []
         
@@ -296,18 +308,20 @@ def extract_and_stitch_pure_vision(job_id, doc, vision_map, export_dir):
             next_q = all_qs_coords[i+1]
             next_q_page = next_q["page"]
             
-            for gap_p in range(curr_p + 1, next_q_page):
+            # Only stitch if next question is actually on a later page
+            if next_q_page > curr_p:
+                for gap_p in range(curr_p + 1, next_q_page):
+                    segments.append({
+                        "page": gap_p,
+                        "rect": fitz.Rect(safe_x0, 40, safe_x1, doc[gap_p].rect.height - 40)
+                    })
+                
+                next_q_y = next_q["rect"].y0 - 20
+                next_q_y = max(50, next_q_y)
                 segments.append({
-                    "page": gap_p,
-                    "rect": fitz.Rect(safe_x0, 40, safe_x1, doc[gap_p].rect.height - 40)
+                    "page": next_q_page,
+                    "rect": fitz.Rect(safe_x0, 40, safe_x1, next_q_y)
                 })
-            
-            next_q_y = next_q["rect"].y0 - 20
-            next_q_y = max(50, next_q_y)
-            segments.append({
-                "page": next_q_page,
-                "rect": fitz.Rect(safe_x0, 40, safe_x1, next_q_y)
-            })
 
         images = []
         total_h = 0
