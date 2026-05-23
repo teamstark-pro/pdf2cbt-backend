@@ -119,16 +119,13 @@ def pixmap_to_base64(pix):
 # ==========================================
 
 def get_dynamic_regex_pattern(job_id, doc):
-    """
-    Sends the first page to Groq to identify the exact question numbering format.
-    Returns a Python-compatible Regex string.
-    """
     try:
-        page = doc[0] # Analyze Page 1
+        page = doc[0]
         pix = page.get_pixmap(dpi=100)
         b64 = pixmap_to_base64(pix)
         
-        prompt = """
+        # ✅ FIXED: Added r""" to prevent \s \d escape sequence crash
+        prompt = r"""
         Look at this exam page.
         Identify how the questions are numbered.
         
@@ -156,7 +153,6 @@ def get_dynamic_regex_pattern(job_id, doc):
         
         if response and "pattern" in response:
             pat = response["pattern"]
-            # Validate regex validity
             try:
                 re.compile(pat)
                 return pat
@@ -168,7 +164,6 @@ def get_dynamic_regex_pattern(job_id, doc):
         return None
     
     return None
-
 # ==========================================
 # STRATEGY 1: REGEX (Dynamic)
 # ==========================================
