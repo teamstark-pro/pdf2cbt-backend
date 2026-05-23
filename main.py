@@ -592,10 +592,10 @@ def home():
 if __name__ == '__main__':
     try:
         port = int(os.environ.get("PORT", 8000))
-        print(f"[STARK] Binding to 0.0.0.0:{port}", flush=True)
+        print(f"[STARK] Starting on 0.0.0.0:{port}", flush=True)
         app.run(host='0.0.0.0', port=port, threaded=True)
     except Exception as e:
-        print(f"[STARK] FATAL STARTUP ERROR: {e}", flush=True)
+        print(f"[STARK] FATAL: {e}", flush=True)
         import traceback
         traceback.print_exc()
         sys.exit(1)
