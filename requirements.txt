@@ -1,6 +1,5 @@
-flask
+Flask
 flask-cors
-pymupdf
-Pillow
+PyMuPDF          # ← NOT "fitz" (fitz on PyPI is a completely different package)
+Pillow           # ← NOT "PIL" (PIL is the import name, Pillow is the package)
 groq
-werkzeug
